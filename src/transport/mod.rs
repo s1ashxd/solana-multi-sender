@@ -81,8 +81,8 @@ impl SenderBuilder {
         if self.providers.is_empty() {
             return Err(SenderError::NoProviders);
         }
-        let source = self.source.expect("source required");
-        let sink = self.sink.expect("sink required");
+        let source = self.source.ok_or(SenderError::NoSource)?;
+        let sink = self.sink.ok_or(SenderError::NoSink)?;
 
         let (trigger_tx, trigger_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
 

@@ -15,6 +15,8 @@ pub enum TriggerError {
 #[derive(Debug)]
 pub enum SenderError {
     NoProviders,
+    NoSource,
+    NoSink,
     Connect { provider: u16, source: TransportError },
 }
 

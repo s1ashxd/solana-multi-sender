@@ -39,7 +39,7 @@ impl SequentialWorker {
             if self.trigger.is_empty() {
                 unsafe {
                     low_latency_utils::wait::idle_wait(self.trigger.tail_ptr(), || {
-                        self.trigger.is_empty()
+                        self.trigger.is_empty() && !stop.load(Ordering::Relaxed)
                     });
                 }
             }
