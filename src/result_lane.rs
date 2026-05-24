@@ -76,7 +76,9 @@ impl ResultLane {
                 }
             }
             if !got {
-                std::hint::spin_loop();
+                if let Some(first) = self.rings.first() {
+                    unsafe { low_latency_utils::wait::idle_wait(first.tail_ptr(), || first.is_empty()) };
+                }
             }
         }
     }
