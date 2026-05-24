@@ -3,6 +3,7 @@ pub enum TransportError {
     Connect(std::io::Error),
     Io(std::io::Error),
     Tls(String),
+    Envelope(EnvelopeError),
     Closed,
 }
 
