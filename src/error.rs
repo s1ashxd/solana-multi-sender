@@ -1,0 +1,28 @@
+#[derive(Debug)]
+pub enum TransportError {
+    Connect(std::io::Error),
+    Io(std::io::Error),
+    Tls(String),
+    Closed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TriggerError {
+    Backpressure,
+}
+
+#[derive(Debug)]
+pub enum SenderError {
+    NoProviders,
+    Connect { provider: u16, source: TransportError },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnvelopeError {
+    BodySentinelMissing,
+    BodyMaxTooSmall { max_len: usize, sentinel: usize },
+    BodyTooLarge { encoded: usize, body_max: usize },
+    ContentLengthOverflow { value: usize, width: u8 },
+    UnknownUserSlot { name: String },
+    UserSlotOverflow { name: String, value: usize, sentinel: usize },
+}
