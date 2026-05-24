@@ -1,0 +1,15 @@
+[package]
+name = "tx-sender"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+low-latency-utils = { path = "../low-latency-utils" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+base64-simd = "0.8"
+arrayvec = "0.7"
+libc = "0.2"
+
+[dev-dependencies]
+rcgen = "0.13"
