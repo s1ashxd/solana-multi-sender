@@ -3,8 +3,7 @@ use std::time::{Duration, Instant};
 
 use rustls::ClientConfig;
 
-use crate::backend::raw_libc::{RawConn, RawLibc};
-use crate::backend::{ByteIo, Wire};
+use crate::backend::{SeqBackend, Wire};
 use crate::error::TransportError;
 use crate::job::{Job, JobId};
 use crate::protocol::http::engine::HttpEngine;
@@ -12,19 +11,19 @@ use crate::protocol::http::envelope::EnvelopeTemplate;
 use crate::protocol::quic::QuicEngine;
 use crate::provider::ProviderConfig;
 
-pub struct HttpConn {
-    io: RawLibc,
-    raw: RawConn,
+pub struct HttpConn<B: SeqBackend> {
+    io: B,
+    raw: B::Conn,
     engine: HttpEngine,
 }
 
-impl HttpConn {
-    pub fn connect(
+impl<B: SeqBackend> HttpConn<B> {
+    pub fn connect_with(
+        mut io: B,
         cfg: &ProviderConfig,
         tls: Arc<ClientConfig>,
         envelope: EnvelopeTemplate,
     ) -> Result<Self, TransportError> {
-        let mut io = RawLibc::new();
         let addr = format!("{}:{}", cfg.endpoint.host, cfg.endpoint.port);
         let mut raw = io.connect(&addr).map_err(TransportError::Connect)?;
         let mut engine = HttpEngine::new(tls, &cfg.endpoint.server_name, envelope)?;
@@ -36,6 +35,7 @@ impl HttpConn {
                 io.submit(&mut raw, Wire::Stream, &out)
                     .map_err(TransportError::Io)?;
             }
+            io.drive();
             match io.poll_recv(&mut raw, &mut rx) {
                 Ok(0) => std::hint::spin_loop(),
                 Ok(n) => {
@@ -53,6 +53,10 @@ impl HttpConn {
         self.io
             .submit(&mut self.raw, Wire::Stream, &cipher)
             .map_err(TransportError::Io)
+    }
+
+    pub fn drive(&mut self) {
+        self.io.drive();
     }
 
     pub fn poll_response(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
@@ -106,26 +110,36 @@ impl QuicConn {
     }
 }
 
-pub enum ConnState {
-    Http(Box<HttpConn>),
+pub enum ConnState<B: SeqBackend> {
+    Http(Box<HttpConn<B>>),
     Quic(Box<QuicConn>),
+}
+
+impl<B: SeqBackend> ConnState<B> {
+    pub fn drive(&mut self) {
+        match self {
+            ConnState::Http(h) => h.drive(),
+            ConnState::Quic(q) => q.drive(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::raw_libc::RawLibc;
 
     #[test]
     fn conn_state_variant_names() {
-        fn is_http(c: &ConnState) -> bool {
+        fn is_http(c: &ConnState<RawLibc>) -> bool {
             matches!(c, ConnState::Http(_))
         }
-        fn is_quic(c: &ConnState) -> bool {
+        fn is_quic(c: &ConnState<RawLibc>) -> bool {
             matches!(c, ConnState::Quic(_))
         }
         let _ = (
-            is_http as fn(&ConnState) -> bool,
-            is_quic as fn(&ConnState) -> bool,
+            is_http as fn(&ConnState<RawLibc>) -> bool,
+            is_quic as fn(&ConnState<RawLibc>) -> bool,
         );
     }
 }

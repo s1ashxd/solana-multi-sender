@@ -1,26 +1,30 @@
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use low_latency_utils::tsc::rdtsc;
 use low_latency_utils::{SpscConsumer, SpscProducer};
 
+use crate::backend::raw_libc::RawLibc;
+use crate::backend::SeqBackend;
 use crate::conn::ConnState;
 use crate::job::Job;
 use crate::result_lane::{RawResp, RESP_CAP, RESULT_RING};
 use crate::sink::OutcomeKind;
 use crate::source::TxSource;
+use crate::transport::{Engine, TransportSpec};
 
 pub const TRIGGER_RING: usize = 256;
 
-pub struct SequentialWorker {
+pub struct SequentialWorker<B: SeqBackend> {
     pub trigger: SpscConsumer<Job, TRIGGER_RING>,
-    pub conns: Vec<ConnState>,
+    pub conns: Vec<ConnState<B>>,
     pub result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
     pub source: Arc<dyn TxSource>,
     pub inflight: Vec<Option<(Job, u64)>>,
 }
 
-impl SequentialWorker {
+impl<B: SeqBackend> SequentialWorker<B> {
     pub fn run(mut self, stop: Arc<AtomicBool>) {
         let mut scratch = [0u8; crate::job::MAX_TX_LEN];
         while !stop.load(Ordering::Relaxed) {
@@ -41,8 +45,12 @@ impl SequentialWorker {
                         }
                     }
                 }
+                for i in 0..self.conns.len() {
+                    self.conns[i].drive();
+                }
             }
             for i in 0..self.conns.len() {
+                self.conns[i].drive();
                 self.reap(i);
             }
             if self.trigger.is_empty() {
@@ -72,7 +80,6 @@ impl SequentialWorker {
                 }
             }
             ConnState::Quic(q) => {
-                q.drive();
                 if let Some((job_id, sent_tsc)) = q.poll_noresp_window() {
                     let mut resp = RawResp::new();
                     resp.job = job_id;
@@ -83,6 +90,32 @@ impl SequentialWorker {
                     let _ = self.result_tx[i].try_push(resp);
                 }
             }
+        }
+    }
+}
+
+pub struct Sequential<B: SeqBackend> {
+    _marker: PhantomData<B>,
+}
+
+impl Sequential<RawLibc> {
+    #[must_use]
+    pub fn raw_libc() -> TransportSpec {
+        TransportSpec {
+            engine_kind: Engine::SeqRaw,
+        }
+    }
+}
+
+#[cfg(feature = "io-uring")]
+impl Sequential<crate::backend::io_uring::IoUring> {
+    #[must_use]
+    pub fn io_uring(mode: crate::backend::io_uring::IoUringMode) -> TransportSpec {
+        TransportSpec {
+            engine_kind: Engine::SeqUring {
+                mode,
+                tuning: Default::default(),
+            },
         }
     }
 }

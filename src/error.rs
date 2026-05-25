@@ -18,6 +18,9 @@ pub enum SenderError {
     NoProviders,
     NoSource,
     NoSink,
+    NoTransport,
+    NoTls,
+    Unsupported(std::io::Error),
     Connect { provider: u16, source: TransportError },
     QuicConfig { provider: u16, reason: String },
 }

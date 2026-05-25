@@ -10,6 +10,7 @@ use tx_sender::provider::response::JsonRpcCodec;
 use tx_sender::provider::{HttpAuth, HttpEndpoint, ProviderConfig, Protocol};
 use tx_sender::sink::{OutcomeKind, ProviderOutcome, ResultSink};
 use tx_sender::source::TxSource;
+use tx_sender::transport::sequential::Sequential;
 use tx_sender::transport::Sender;
 
 #[derive(Debug)]
@@ -99,7 +100,9 @@ fn end_to_end_http_send_and_accept() {
         codec: Arc::new(JsonRpcCodec),
     };
 
-    let sender = Sender::builder(client_cfg)
+    let sender = Sender::builder()
+        .transport(Sequential::raw_libc())
+        .tls(client_cfg)
         .provider(provider)
         .source(Arc::new(FixedTx))
         .sink(Arc::new(ChanSink(std::sync::Mutex::new(tx))))

@@ -9,6 +9,7 @@ use tx_sender::provider::{
 };
 use tx_sender::sink::{OutcomeKind, ProviderOutcome, ResultSink};
 use tx_sender::source::TxSource;
+use tx_sender::transport::sequential::Sequential;
 use tx_sender::transport::Sender;
 
 const TX_BODY: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
@@ -148,7 +149,9 @@ fn quic_send_and_noresp_outcome() {
         codec: Arc::new(JsonRpcCodec),
     };
 
-    let sender = Sender::builder(tls_for_http)
+    let sender = Sender::builder()
+        .transport(Sequential::raw_libc())
+        .tls(tls_for_http)
         .provider(provider)
         .source(Arc::new(FixedTx))
         .sink(Arc::new(ChanSink(Mutex::new(tx_outcome))))
