@@ -3,6 +3,7 @@ pub enum TransportError {
     Connect(std::io::Error),
     Io(std::io::Error),
     Tls(String),
+    Quic(String),
     Envelope(EnvelopeError),
     Closed,
 }
@@ -18,6 +19,7 @@ pub enum SenderError {
     NoSource,
     NoSink,
     Connect { provider: u16, source: TransportError },
+    QuicConfig { provider: u16, reason: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
