@@ -13,6 +13,11 @@ libc = "0.2"
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 bytes = "1"
 rcgen = "0.13"
+io-uring = { version = "0.7", optional = true }
+
+[features]
+default = ["io-uring"]
+io-uring = ["dep:io-uring"]
 
 [dev-dependencies]
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
