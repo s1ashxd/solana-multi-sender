@@ -9,9 +9,10 @@ use tx_sender::job::{Job, ProviderId, MAX_TX_LEN};
 use tx_sender::provider::response::JsonRpcCodec;
 use tx_sender::provider::{HttpAuth, HttpEndpoint, ProviderConfig, Protocol};
 use tx_sender::sink::{OutcomeKind, ProviderOutcome, ResultSink};
+use tx_sender::error::SenderError;
 use tx_sender::source::TxSource;
 use tx_sender::transport::sequential::Sequential;
-use tx_sender::transport::Sender;
+use tx_sender::transport::{Sender, TransportSpec};
 
 #[derive(Debug)]
 struct AcceptAll;
@@ -72,8 +73,7 @@ impl ResultSink for ChanSink {
     }
 }
 
-#[test]
-fn end_to_end_http_send_and_accept() {
+fn run_case(spec: TransportSpec) {
     let port = spawn_tls_server();
 
     let client_cfg = Arc::new(
@@ -100,14 +100,21 @@ fn end_to_end_http_send_and_accept() {
         codec: Arc::new(JsonRpcCodec),
     };
 
-    let sender = Sender::builder()
-        .transport(Sequential::raw_libc())
+    let sender = match Sender::builder()
+        .transport(spec)
         .tls(client_cfg)
         .provider(provider)
         .source(Arc::new(FixedTx))
         .sink(Arc::new(ChanSink(std::sync::Mutex::new(tx))))
         .build()
-        .unwrap();
+    {
+        Ok(s) => s,
+        Err(SenderError::Unsupported(e)) => {
+            eprintln!("transport unsupported on this kernel, skipping: {e}");
+            return;
+        }
+        Err(e) => panic!("{e:?}"),
+    };
 
     sender.trigger(Job { id: 99, ctx: 0 }).unwrap();
 
@@ -119,6 +126,27 @@ fn end_to_end_http_send_and_accept() {
     }
 
     sender.shutdown();
+}
+
+#[test]
+fn end_to_end_http_send_and_accept() {
+    run_case(Sequential::raw_libc());
+}
+
+#[cfg(feature = "io-uring")]
+#[test]
+fn end_to_end_http_send_and_accept_uring_batch() {
+    run_case(Sequential::io_uring(
+        tx_sender::prelude::IoUringMode::BatchSyscall,
+    ));
+}
+
+#[cfg(feature = "io-uring")]
+#[test]
+fn end_to_end_http_send_and_accept_uring_stream() {
+    run_case(Sequential::io_uring(
+        tx_sender::prelude::IoUringMode::SqeStream,
+    ));
 }
 
 fn tls_server_thread(
