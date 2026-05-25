@@ -22,3 +22,16 @@ pub trait ByteIo {
 pub trait SeqBackend: ByteIo {}
 
 impl SeqBackend for raw_libc::RawLibc {}
+
+pub trait ParBackend: ByteIo {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::raw_libc::RawLibc;
+    fn assert_par_backend<B: ParBackend>() {}
+    #[test]
+    fn raw_libc_is_par_backend() {
+        assert_par_backend::<RawLibc>();
+    }
+}

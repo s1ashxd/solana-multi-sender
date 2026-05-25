@@ -126,6 +126,8 @@ impl ByteIo for RawLibc {
     }
 }
 
+impl crate::backend::ParBackend for RawLibc {}
+
 impl UdpConn {
     pub fn send_to(&self, dst: SocketAddr, buf: &[u8]) -> io::Result<()> {
         udp_sendto(self.fd, dst, buf)
