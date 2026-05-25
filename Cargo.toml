@@ -10,6 +10,7 @@ rustls-pki-types = "1"
 base64-simd = "0.8"
 arrayvec = "0.7"
 libc = "0.2"
+core_affinity = "0.8"
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 bytes = "1"
 rcgen = "0.13"
