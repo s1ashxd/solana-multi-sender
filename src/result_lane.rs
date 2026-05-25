@@ -5,7 +5,7 @@ use low_latency_utils::SpscConsumer;
 
 use crate::job::{JobId, ProviderId};
 use crate::provider::response::ResponseCodec;
-use crate::sink::{ProviderOutcome, ResultSink};
+use crate::sink::{OutcomeKind, ProviderOutcome, ResultSink};
 
 pub const RESP_CAP: usize = 1024;
 pub const RESULT_RING: usize = 256;
@@ -16,6 +16,7 @@ pub struct RawResp {
     pub sent_tsc: u64,
     pub settled_tsc: u64,
     pub bytes: ArrayVec<u8, RESP_CAP>,
+    pub outcome_hint: Option<OutcomeKind>,
 }
 
 impl RawResp {
@@ -27,6 +28,7 @@ impl RawResp {
             sent_tsc: 0,
             settled_tsc: 0,
             bytes: ArrayVec::new(),
+            outcome_hint: None,
         }
     }
 }
@@ -38,7 +40,11 @@ impl Default for RawResp {
 }
 
 pub(crate) fn parse_one(resp: &RawResp, codec: &dyn ResponseCodec) -> ProviderOutcome {
-    let kind = codec.parse(&resp.bytes);
+    let kind = if matches!(resp.outcome_hint, Some(OutcomeKind::NoResponse)) {
+        OutcomeKind::NoResponse
+    } else {
+        codec.parse(&resp.bytes)
+    };
     ProviderOutcome {
         job: resp.job,
         provider: resp.provider,

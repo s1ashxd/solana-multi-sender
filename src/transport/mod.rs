@@ -6,8 +6,9 @@ use std::thread::JoinHandle;
 
 use rustls::ClientConfig;
 
-use crate::conn::HttpConn;
+use crate::conn::{ConnState, HttpConn, QuicConn};
 use crate::error::{SenderError, TriggerError};
+use crate::protocol::quic::QuicEngine;
 use crate::job::Job;
 use crate::protocol::http::spec_builder::EnvelopeSpecBuilder;
 use crate::provider::response::ResponseCodec;
@@ -92,11 +93,36 @@ impl SenderBuilder {
         let mut codecs: Vec<Arc<dyn ResponseCodec>> = Vec::new();
 
         for (i, p) in self.providers.iter().enumerate() {
-            let spec = build_envelope(p);
-            let tpl = spec.compile().expect("envelope compiles");
-            let conn = HttpConn::connect(p, self.tls.clone(), tpl)
-                .map_err(|e| SenderError::Connect { provider: i as u16, source: e })?;
-            conns.push(conn);
+            let conn_state = match p.protocol {
+                crate::provider::Protocol::Http => {
+                    let spec = build_envelope(p);
+                    let tpl = spec.compile().expect("envelope compiles");
+                    let conn = HttpConn::connect(p, self.tls.clone(), tpl)
+                        .map_err(|e| SenderError::Connect { provider: i as u16, source: e })?;
+                    ConnState::Http(Box::new(conn))
+                }
+                crate::provider::Protocol::Quic => {
+                    let quic_ep = p.quic_endpoint.as_ref().ok_or_else(|| SenderError::QuicConfig {
+                        provider: i as u16,
+                        reason: "missing quic_endpoint".into(),
+                    })?;
+                    let quic_profile = p.quic_profile.as_ref().ok_or_else(|| SenderError::QuicConfig {
+                        provider: i as u16,
+                        reason: "missing quic_profile".into(),
+                    })?;
+                    let quic_auth = p.quic_auth.as_ref().ok_or_else(|| SenderError::QuicConfig {
+                        provider: i as u16,
+                        reason: "missing quic_auth".into(),
+                    })?;
+                    let client_cfg =
+                        crate::protocol::quic_cert::build_quic_client_config(quic_profile, quic_auth)
+                            .map_err(|e| SenderError::Connect { provider: i as u16, source: e })?;
+                    let engine = QuicEngine::connect(client_cfg, quic_ep.addr, &quic_ep.server_name)
+                        .map_err(|e| SenderError::Connect { provider: i as u16, source: e })?;
+                    ConnState::Quic(Box::new(QuicConn::new(engine)))
+                }
+            };
+            conns.push(conn_state);
             let (tx, rx) = low_latency_utils::spsc::channel::<RawResp, RESULT_RING>();
             result_tx.push(tx);
             result_rx.push(rx);
