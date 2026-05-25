@@ -1,5 +1,8 @@
 pub mod raw_libc;
 
+#[cfg(feature = "io-uring")]
+pub mod io_uring;
+
 use std::net::SocketAddr;
 
 pub enum Wire {
@@ -15,3 +18,7 @@ pub trait ByteIo {
     fn poll_recv(&mut self, conn: &mut Self::Conn, buf: &mut [u8]) -> std::io::Result<usize>;
     fn drive(&mut self) {}
 }
+
+pub trait SeqBackend: ByteIo {}
+
+impl SeqBackend for raw_libc::RawLibc {}
