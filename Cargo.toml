@@ -16,9 +16,11 @@ bytes = "1"
 rcgen = "0.13"
 io-uring = { version = "0.7", optional = true }
 crossbeam-channel = "0.5"
+webpki-roots = "0.26"
 
 [features]
-default = ["io-uring"]
+default = ["registry", "io-uring"]
+registry = []
 io-uring = ["dep:io-uring"]
 
 [dev-dependencies]

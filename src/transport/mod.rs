@@ -487,6 +487,20 @@ where
     (Dispatch::Fanout(trigger_txs), handles)
 }
 
+pub fn real_roots() -> rustls::RootCertStore {
+    let mut store = rustls::RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    store
+}
+
+pub fn real_roots_client_config() -> std::sync::Arc<rustls::ClientConfig> {
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(real_roots())
+            .with_no_client_auth(),
+    )
+}
+
 fn build_envelope(p: &ProviderConfig) -> crate::protocol::http::envelope::EnvelopeSpec {
     use crate::protocol::http::spec_builder::AuthPlacement;
     let auth = match &p.auth {
@@ -514,4 +528,14 @@ fn build_envelope(p: &ProviderConfig) -> crate::protocol::http::envelope::Envelo
         b = b.body_template(&p.body_template);
     }
     b.build()
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    #[test]
+    fn real_roots_returns_non_empty_store() {
+        assert!(!real_roots().is_empty());
+    }
 }
