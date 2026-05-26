@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use rustls::ClientConfig;
 
-use crate::backend::{SeqBackend, Wire};
+use crate::backend::{ByteIo, Wire};
 use crate::error::TransportError;
 use crate::job::{Job, JobId};
 use crate::protocol::http::engine::HttpEngine;
@@ -11,13 +11,13 @@ use crate::protocol::http::envelope::EnvelopeTemplate;
 use crate::protocol::quic::QuicEngine;
 use crate::provider::ProviderConfig;
 
-pub struct HttpConn<B: SeqBackend> {
+pub struct HttpConn<B: ByteIo> {
     io: B,
     raw: B::Conn,
     engine: HttpEngine,
 }
 
-impl<B: SeqBackend> HttpConn<B> {
+impl<B: ByteIo> HttpConn<B> {
     pub fn connect_with(
         mut io: B,
         cfg: &ProviderConfig,
@@ -110,12 +110,12 @@ impl QuicConn {
     }
 }
 
-pub enum ConnState<B: SeqBackend> {
+pub enum ConnState<B: ByteIo> {
     Http(Box<HttpConn<B>>),
     Quic(Box<QuicConn>),
 }
 
-impl<B: SeqBackend> ConnState<B> {
+impl<B: ByteIo> ConnState<B> {
     pub fn drive(&mut self) {
         match self {
             ConnState::Http(h) => h.drive(),
