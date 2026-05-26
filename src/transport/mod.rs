@@ -1,3 +1,4 @@
+pub mod parallel;
 pub mod sequential;
 
 use std::sync::atomic::AtomicBool;
@@ -32,10 +33,31 @@ pub enum Engine {
         mode: IoUringMode,
         tuning: IoUringTuning,
     },
+    ParRaw {
+        cfg: crate::transport::parallel::ParallelConfig,
+    },
 }
 
 pub struct TransportSpec {
     pub(crate) engine_kind: Engine,
+}
+
+impl TransportSpec {
+    #[must_use]
+    pub fn affinity(mut self, cores: crate::transport::parallel::CoreSet) -> Self {
+        if let Engine::ParRaw { cfg } = &mut self.engine_kind {
+            cfg.affinity = Some(cores);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn rt_priority(mut self, priority: i32) -> Self {
+        if let Engine::ParRaw { cfg } = &mut self.engine_kind {
+            cfg.rt.priority = Some(priority);
+        }
+        self
+    }
 }
 
 #[cfg(feature = "io-uring")]
@@ -57,8 +79,13 @@ pub struct SenderBuilder {
     tls: Option<Arc<ClientConfig>>,
 }
 
+enum Dispatch {
+    Single(SpscProducer<Job, TRIGGER_RING>),
+    Fanout(Vec<SpscProducer<Job, TRIGGER_RING>>),
+}
+
 pub struct Sender {
-    trigger: SpscProducer<Job, TRIGGER_RING>,
+    dispatch: Dispatch,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
 }
@@ -76,10 +103,27 @@ impl Sender {
     }
 
     pub fn trigger(&self, job: Job) -> Result<(), TriggerError> {
-        if self.trigger.try_push(job) {
-            Ok(())
-        } else {
-            Err(TriggerError::Backpressure)
+        match &self.dispatch {
+            Dispatch::Single(tx) => {
+                if tx.try_push(job) {
+                    Ok(())
+                } else {
+                    Err(TriggerError::Backpressure)
+                }
+            }
+            Dispatch::Fanout(txs) => {
+                let mut ok = true;
+                for tx in txs {
+                    if !tx.try_push(job) {
+                        ok = false;
+                    }
+                }
+                if ok {
+                    Ok(())
+                } else {
+                    Err(TriggerError::Backpressure)
+                }
+            }
         }
     }
 
@@ -131,7 +175,6 @@ impl SenderBuilder {
         let source = self.source.ok_or(SenderError::NoSource)?;
         let sink = self.sink.ok_or(SenderError::NoSink)?;
 
-        let (trigger_tx, trigger_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
         let stop = Arc::new(AtomicBool::new(false));
 
         let mut result_tx = Vec::new();
@@ -148,25 +191,33 @@ impl SenderBuilder {
         let lane_stop = stop.clone();
         let lane_handle = std::thread::spawn(move || lane.run(&lane_stop));
 
-        let worker_stop = stop.clone();
-        let worker_handle = match spec.engine_kind {
+        let (dispatch, mut workers): (Dispatch, Vec<JoinHandle<()>>) = match spec.engine_kind {
             Engine::SeqRaw => {
                 let conns = connect_all(&self.providers, &tls, |_| Ok(RawLibc::new()))?;
-                spawn_seq(conns, trigger_rx, result_tx, source, worker_stop)
+                let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+                let h = spawn_seq(conns, trig_rx, result_tx, source, stop.clone());
+                (Dispatch::Single(trig_tx), vec![h])
             }
             #[cfg(feature = "io-uring")]
             Engine::SeqUring { mode, tuning } => {
                 let conns = connect_all(&self.providers, &tls, move |_| {
                     IoUring::new(mode, tuning.clone()).map_err(SenderError::Unsupported)
                 })?;
-                spawn_seq(conns, trigger_rx, result_tx, source, worker_stop)
+                let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+                let h = spawn_seq(conns, trig_rx, result_tx, source, stop.clone());
+                (Dispatch::Single(trig_tx), vec![h])
+            }
+            Engine::ParRaw { cfg } => {
+                let conns = connect_all(&self.providers, &tls, |_| Ok(RawLibc::new()))?;
+                spawn_parallel(conns, result_tx, source, cfg, stop.clone())
             }
         };
+        workers.push(lane_handle);
 
         Ok(Sender {
-            trigger: trigger_tx,
+            dispatch,
             stop,
-            workers: vec![worker_handle, lane_handle],
+            workers,
         })
     }
 }
@@ -246,6 +297,58 @@ where
         inflight,
     };
     std::thread::spawn(move || worker.run(stop))
+}
+
+fn spawn_parallel<B>(
+    conns: Vec<ConnState<B>>,
+    result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
+    source: Arc<dyn TxSource>,
+    cfg: crate::transport::parallel::ParallelConfig,
+    stop: Arc<AtomicBool>,
+) -> (Dispatch, Vec<JoinHandle<()>>)
+where
+    B: crate::backend::ParBackend + Send + 'static,
+    B::Conn: Send + 'static,
+{
+    use crate::transport::parallel::ParWorker;
+
+    let core_ids: Vec<usize> = cfg
+        .affinity
+        .as_ref()
+        .map(|c| c.ids().to_vec())
+        .unwrap_or_default();
+    let rt_priority = cfg.rt.priority;
+
+    let mut trigger_txs = Vec::with_capacity(conns.len());
+    let mut handles = Vec::with_capacity(conns.len());
+
+    for (i, (conn, res_tx)) in conns.into_iter().zip(result_tx).enumerate() {
+        let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+        trigger_txs.push(trig_tx);
+
+        let worker = ParWorker {
+            provider_idx: i,
+            trigger: trig_rx,
+            result_tx: res_tx,
+            source: source.clone(),
+            conn,
+            inflight: None,
+        };
+        let core_id = core_ids.get(i).copied();
+        let worker_stop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            if let Some(id) = core_id {
+                crate::rt::pin_current_thread(id);
+            }
+            if let Some(prio) = rt_priority {
+                let _ = crate::rt::set_sched_fifo(prio);
+            }
+            worker.run(worker_stop);
+        });
+        handles.push(handle);
+    }
+
+    (Dispatch::Fanout(trigger_txs), handles)
 }
 
 fn build_envelope(p: &ProviderConfig) -> crate::protocol::http::envelope::EnvelopeSpec {

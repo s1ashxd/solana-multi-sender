@@ -15,6 +15,7 @@ pub mod prelude {
     pub use crate::provider::{HttpAuth, HttpEndpoint, ProviderConfig, Protocol};
     pub use crate::sink::{OutcomeKind, ProviderOutcome, ResultSink};
     pub use crate::source::TxSource;
+    pub use crate::transport::parallel::{CoreSet, Parallel, ParallelConfig, RtConfig};
     pub use crate::transport::sequential::Sequential;
     pub use crate::transport::{Sender, SenderBuilder, TransportSpec};
     #[cfg(feature = "io-uring")]
