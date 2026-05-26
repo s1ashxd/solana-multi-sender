@@ -8,8 +8,8 @@ use std::thread::JoinHandle;
 use rustls::ClientConfig;
 
 use crate::backend::raw_libc::RawLibc;
-use crate::backend::SeqBackend;
-use crate::conn::{ConnState, HttpConn, QuicConn};
+use crate::conn::reconnect::{ConnKind, ReconnectThread};
+use crate::conn::{ConnState, DualConn, HttpConn, QuicConn};
 use crate::error::{SenderError, TriggerError};
 use crate::job::Job;
 use crate::protocol::http::spec_builder::EnvelopeSpecBuilder;
@@ -88,6 +88,7 @@ pub struct Sender {
     dispatch: Dispatch,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
+    reconnect: ReconnectThread,
 }
 
 impl Sender {
@@ -132,6 +133,7 @@ impl Sender {
         for w in self.workers {
             let _ = w.join();
         }
+        self.reconnect.join();
     }
 }
 
@@ -191,119 +193,246 @@ impl SenderBuilder {
         let lane_stop = stop.clone();
         let lane_handle = std::thread::spawn(move || lane.run(&lane_stop));
 
-        let (dispatch, mut workers): (Dispatch, Vec<JoinHandle<()>>) = match spec.engine_kind {
-            Engine::SeqRaw => {
-                let conns = connect_all(&self.providers, &tls, |_| Ok(RawLibc::new()))?;
-                let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
-                let h = spawn_seq(conns, trig_rx, result_tx, source, stop.clone());
-                (Dispatch::Single(trig_tx), vec![h])
-            }
-            #[cfg(feature = "io-uring")]
-            Engine::SeqUring { mode, tuning } => {
-                let conns = connect_all(&self.providers, &tls, move |_| {
-                    IoUring::new(mode, tuning.clone()).map_err(SenderError::Unsupported)
-                })?;
-                let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
-                let h = spawn_seq(conns, trig_rx, result_tx, source, stop.clone());
-                (Dispatch::Single(trig_tx), vec![h])
-            }
-            Engine::ParRaw { cfg } => {
-                let conns = connect_all(&self.providers, &tls, |_| Ok(RawLibc::new()))?;
-                spawn_parallel(conns, result_tx, source, cfg, stop.clone())
-            }
-        };
+        let n = self.providers.len();
+        let mut resp_txs = Vec::with_capacity(n);
+        let mut resp_rxs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (t, r) = crossbeam_channel::bounded::<crate::conn::reconnect::ReconnectResp>(1);
+            resp_txs.push(t);
+            resp_rxs.push(r);
+        }
+
+        let (dispatch, mut workers, reconnect): (Dispatch, Vec<JoinHandle<()>>, ReconnectThread) =
+            match spec.engine_kind {
+                Engine::SeqRaw => {
+                    let duals =
+                        connect_dual_all::<RawLibc, _>(&self.providers, &tls, &|_| Ok(RawLibc::new()))?;
+                    let builder = Box::new(EngineReconnectBuilder::<RawLibc, _> {
+                        providers: self.providers.clone(),
+                        tls: tls.clone(),
+                        make: |_| Ok(RawLibc::new()),
+                        _marker: std::marker::PhantomData,
+                    });
+                    let reconnect = ReconnectThread::spawn(builder, resp_txs, stop.clone());
+                    let req_tx = reconnect.sender();
+                    let (trig_tx, trig_rx) =
+                        low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+                    let h = spawn_seq(
+                        duals,
+                        trig_rx,
+                        result_tx,
+                        source,
+                        req_tx,
+                        resp_rxs,
+                        ConnKind::RawLibc,
+                        stop.clone(),
+                    );
+                    (Dispatch::Single(trig_tx), vec![h], reconnect)
+                }
+                #[cfg(feature = "io-uring")]
+                Engine::SeqUring { mode, tuning } => {
+                    let m = mode;
+                    let warmup_tuning = tuning.clone();
+                    let duals = connect_dual_all::<IoUring, _>(&self.providers, &tls, &move |_| {
+                        IoUring::new(m, warmup_tuning.clone()).map_err(SenderError::Unsupported)
+                    })?;
+                    let builder_tuning = tuning.clone();
+                    let builder = Box::new(EngineReconnectBuilder::<IoUring, _> {
+                        providers: self.providers.clone(),
+                        tls: tls.clone(),
+                        make: move |_| {
+                            IoUring::new(m, builder_tuning.clone()).map_err(SenderError::Unsupported)
+                        },
+                        _marker: std::marker::PhantomData,
+                    });
+                    let reconnect = ReconnectThread::spawn(builder, resp_txs, stop.clone());
+                    let req_tx = reconnect.sender();
+                    let (trig_tx, trig_rx) =
+                        low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+                    let h = spawn_seq(
+                        duals,
+                        trig_rx,
+                        result_tx,
+                        source,
+                        req_tx,
+                        resp_rxs,
+                        ConnKind::IoUring,
+                        stop.clone(),
+                    );
+                    (Dispatch::Single(trig_tx), vec![h], reconnect)
+                }
+                Engine::ParRaw { cfg } => {
+                    let duals =
+                        connect_dual_all::<RawLibc, _>(&self.providers, &tls, &|_| Ok(RawLibc::new()))?;
+                    let builder = Box::new(EngineReconnectBuilder::<RawLibc, _> {
+                        providers: self.providers.clone(),
+                        tls: tls.clone(),
+                        make: |_| Ok(RawLibc::new()),
+                        _marker: std::marker::PhantomData,
+                    });
+                    let reconnect = ReconnectThread::spawn(builder, resp_txs, stop.clone());
+                    let req_tx = reconnect.sender();
+                    let (dispatch, handles) = spawn_parallel(
+                        duals,
+                        result_tx,
+                        source,
+                        cfg,
+                        req_tx,
+                        resp_rxs,
+                        ConnKind::RawLibc,
+                        stop.clone(),
+                    );
+                    (dispatch, handles, reconnect)
+                }
+            };
         workers.push(lane_handle);
 
         Ok(Sender {
             dispatch,
             stop,
             workers,
+            reconnect,
         })
     }
 }
 
-fn connect_all<B, F>(
+fn connect_one<B, F>(
     providers: &[ProviderConfig],
+    i: usize,
     tls: &Arc<ClientConfig>,
-    make: F,
-) -> Result<Vec<ConnState<B>>, SenderError>
+    make: &F,
+) -> Result<ConnState<B>, SenderError>
 where
-    B: SeqBackend,
+    B: crate::backend::ByteIo,
     F: Fn(usize) -> Result<B, SenderError>,
 {
-    let mut conns = Vec::with_capacity(providers.len());
-    for (i, p) in providers.iter().enumerate() {
-        let conn_state = match p.protocol {
-            Protocol::Http => {
-                let spec = build_envelope(p);
-                let tpl = spec.compile().expect("envelope compiles");
-                let io = make(i)?;
-                let conn = HttpConn::connect_with(io, p, tls.clone(), tpl)
+    let p = &providers[i];
+    match p.protocol {
+        Protocol::Http => {
+            let spec = build_envelope(p);
+            let tpl = spec.compile().expect("envelope compiles");
+            let io = make(i)?;
+            let conn = HttpConn::connect_with(io, p, tls.clone(), tpl).map_err(|e| {
+                SenderError::Connect {
+                    provider: i as u16,
+                    source: e,
+                }
+            })?;
+            Ok(ConnState::Http(Box::new(conn)))
+        }
+        Protocol::Quic => {
+            let quic_ep = p.quic_endpoint.as_ref().ok_or_else(|| SenderError::QuicConfig {
+                provider: i as u16,
+                reason: "missing quic_endpoint".into(),
+            })?;
+            let quic_profile = p.quic_profile.as_ref().ok_or_else(|| SenderError::QuicConfig {
+                provider: i as u16,
+                reason: "missing quic_profile".into(),
+            })?;
+            let quic_auth = p.quic_auth.as_ref().ok_or_else(|| SenderError::QuicConfig {
+                provider: i as u16,
+                reason: "missing quic_auth".into(),
+            })?;
+            let client_cfg =
+                crate::protocol::quic_cert::build_quic_client_config(quic_profile, quic_auth)
                     .map_err(|e| SenderError::Connect {
                         provider: i as u16,
                         source: e,
                     })?;
-                ConnState::Http(Box::new(conn))
-            }
-            Protocol::Quic => {
-                let quic_ep = p.quic_endpoint.as_ref().ok_or_else(|| SenderError::QuicConfig {
+            let engine = QuicEngine::connect(client_cfg, quic_ep.addr, &quic_ep.server_name)
+                .map_err(|e| SenderError::Connect {
                     provider: i as u16,
-                    reason: "missing quic_endpoint".into(),
+                    source: e,
                 })?;
-                let quic_profile = p.quic_profile.as_ref().ok_or_else(|| SenderError::QuicConfig {
-                    provider: i as u16,
-                    reason: "missing quic_profile".into(),
-                })?;
-                let quic_auth = p.quic_auth.as_ref().ok_or_else(|| SenderError::QuicConfig {
-                    provider: i as u16,
-                    reason: "missing quic_auth".into(),
-                })?;
-                let client_cfg =
-                    crate::protocol::quic_cert::build_quic_client_config(quic_profile, quic_auth)
-                        .map_err(|e| SenderError::Connect {
-                            provider: i as u16,
-                            source: e,
-                        })?;
-                let engine = QuicEngine::connect(client_cfg, quic_ep.addr, &quic_ep.server_name)
-                    .map_err(|e| SenderError::Connect {
-                        provider: i as u16,
-                        source: e,
-                    })?;
-                ConnState::Quic(Box::new(QuicConn::new(engine)))
-            }
-        };
-        conns.push(conn_state);
+            Ok(ConnState::Quic(Box::new(QuicConn::new(engine))))
+        }
     }
-    Ok(conns)
 }
 
+fn connect_dual_all<B, F>(
+    providers: &[ProviderConfig],
+    tls: &Arc<ClientConfig>,
+    make: &F,
+) -> Result<Vec<DualConn<ConnState<B>>>, SenderError>
+where
+    B: crate::backend::ByteIo,
+    F: Fn(usize) -> Result<B, SenderError>,
+{
+    let mut duals = Vec::with_capacity(providers.len());
+    for i in 0..providers.len() {
+        let active = connect_one::<B, F>(providers, i, tls, make)?;
+        let standby = connect_one::<B, F>(providers, i, tls, make)?;
+        duals.push(DualConn::new(active, standby));
+    }
+    Ok(duals)
+}
+
+struct EngineReconnectBuilder<B, F>
+where
+    B: crate::backend::ByteIo + Send + 'static,
+    F: Fn(usize) -> Result<B, SenderError> + Send + 'static,
+{
+    providers: Vec<ProviderConfig>,
+    tls: Arc<ClientConfig>,
+    make: F,
+    _marker: std::marker::PhantomData<B>,
+}
+
+impl<B, F> crate::conn::reconnect::ReconnectBuilder for EngineReconnectBuilder<B, F>
+where
+    B: crate::backend::ByteIo + Send + 'static,
+    F: Fn(usize) -> Result<B, SenderError> + Send + 'static,
+    ConnState<B>: Send + 'static,
+{
+    fn build(
+        &self,
+        provider_idx: usize,
+        _kind: ConnKind,
+    ) -> Result<crate::conn::reconnect::ConnBox, crate::conn::reconnect::ReconnectError> {
+        let conn = connect_one::<B, _>(&self.providers, provider_idx, &self.tls, &|i| {
+            (self.make)(i)
+        })
+        .map_err(|e| crate::conn::reconnect::ReconnectError::Build(format!("{e:?}")))?;
+        Ok(Box::new(conn))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_seq<B>(
-    conns: Vec<ConnState<B>>,
+    duals: Vec<DualConn<ConnState<B>>>,
     trigger: SpscConsumer<Job, TRIGGER_RING>,
     result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
     source: Arc<dyn TxSource>,
+    reconnect_req_tx: crossbeam_channel::Sender<crate::conn::reconnect::ReconnectReq>,
+    reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
+    conn_kind: ConnKind,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()>
 where
-    B: SeqBackend + Send + 'static,
+    B: crate::backend::SeqBackend + Send + 'static,
     B::Conn: Send + 'static,
 {
-    let inflight = (0..conns.len()).map(|_| None).collect();
-    let worker = SequentialWorker {
+    let worker = SequentialWorker::new(
         trigger,
-        conns,
+        duals,
         result_tx,
         source,
-        inflight,
-    };
+        reconnect_req_tx,
+        reconnect_resp_rx,
+        conn_kind,
+    );
     std::thread::spawn(move || worker.run(stop))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_parallel<B>(
-    conns: Vec<ConnState<B>>,
+    duals: Vec<DualConn<ConnState<B>>>,
     result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
     source: Arc<dyn TxSource>,
     cfg: crate::transport::parallel::ParallelConfig,
+    reconnect_req_tx: crossbeam_channel::Sender<crate::conn::reconnect::ReconnectReq>,
+    reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
+    conn_kind: ConnKind,
     stop: Arc<AtomicBool>,
 ) -> (Dispatch, Vec<JoinHandle<()>>)
 where
@@ -319,21 +448,28 @@ where
         .unwrap_or_default();
     let rt_priority = cfg.rt.priority;
 
-    let mut trigger_txs = Vec::with_capacity(conns.len());
-    let mut handles = Vec::with_capacity(conns.len());
+    let mut trigger_txs = Vec::with_capacity(duals.len());
+    let mut handles = Vec::with_capacity(duals.len());
 
-    for (i, (conn, res_tx)) in conns.into_iter().zip(result_tx).enumerate() {
+    for (i, ((dual_conn, res_tx), resp_rx)) in duals
+        .into_iter()
+        .zip(result_tx)
+        .zip(reconnect_resp_rx)
+        .enumerate()
+    {
         let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
         trigger_txs.push(trig_tx);
 
-        let worker = ParWorker {
-            provider_idx: i,
-            trigger: trig_rx,
-            result_tx: res_tx,
-            source: source.clone(),
-            conn,
-            inflight: None,
-        };
+        let worker = ParWorker::new(
+            i,
+            trig_rx,
+            res_tx,
+            source.clone(),
+            dual_conn,
+            reconnect_req_tx.clone(),
+            resp_rx,
+            conn_kind,
+        );
         let core_id = core_ids.get(i).copied();
         let worker_stop = stop.clone();
         let handle = std::thread::spawn(move || {

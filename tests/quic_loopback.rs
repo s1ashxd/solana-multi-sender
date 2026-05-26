@@ -98,14 +98,17 @@ fn spawn_quic_server() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
             let endpoint =
                 quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
             addr_tx.send(endpoint.local_addr().unwrap()).unwrap();
-            if let Some(incoming) = endpoint.accept().await {
-                if let Ok(conn) = incoming.await {
-                    while let Ok(mut recv) = conn.accept_uni().await {
-                        if let Ok(data) = recv.read_to_end(MAX_TX_LEN).await {
-                            received_clone.lock().unwrap().push(data);
+            while let Some(incoming) = endpoint.accept().await {
+                let received_conn = received_clone.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        while let Ok(mut recv) = conn.accept_uni().await {
+                            if let Ok(data) = recv.read_to_end(MAX_TX_LEN).await {
+                                received_conn.lock().unwrap().push(data);
+                            }
                         }
                     }
-                }
+                });
             }
         });
     });

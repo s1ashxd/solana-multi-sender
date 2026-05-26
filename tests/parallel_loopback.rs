@@ -73,7 +73,6 @@ impl ResultSink for CollectSink {
 }
 
 fn spawn_mock_server(sig: &'static str) -> u16 {
-    use std::io::{Read, Write};
     use std::net::TcpListener;
 
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -89,7 +88,17 @@ fn spawn_mock_server(sig: &'static str) -> u16 {
     let port = listener.local_addr().unwrap().port();
 
     std::thread::spawn(move || {
-        let (mut sock, _) = listener.accept().unwrap();
+        while let Ok((sock, _)) = listener.accept() {
+            let cfg = server_cfg.clone();
+            std::thread::spawn(move || serve_one(sock, cfg, sig));
+        }
+    });
+    port
+}
+
+fn serve_one(mut sock: std::net::TcpStream, server_cfg: Arc<rustls::ServerConfig>, sig: &str) {
+    use std::io::{Read, Write};
+    {
         let mut conn = rustls::ServerConnection::new(server_cfg).unwrap();
         while conn.is_handshaking() {
             while conn.wants_write() {
@@ -144,8 +153,7 @@ fn spawn_mock_server(sig: &'static str) -> u16 {
             sock.write_all(&out).unwrap();
         }
         let _ = sock.flush();
-    });
-    port
+    }
 }
 
 fn make_provider(port: u16) -> ProviderConfig {

@@ -149,13 +149,9 @@ fn end_to_end_http_send_and_accept_uring_stream() {
     ));
 }
 
-fn tls_server_thread(
-    listener: std::net::TcpListener,
-    server_cfg: Arc<rustls::ServerConfig>,
-) {
+fn serve_connection(mut sock: std::net::TcpStream, server_cfg: Arc<rustls::ServerConfig>) {
     use std::io::{Read, Write};
 
-    let (mut sock, _) = listener.accept().unwrap();
     let mut conn = rustls::ServerConnection::new(server_cfg).unwrap();
     let mut buf = [0u8; 8192];
 
@@ -241,7 +237,12 @@ fn spawn_tls_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    std::thread::spawn(move || tls_server_thread(listener, server_cfg));
+    std::thread::spawn(move || {
+        while let Ok((sock, _)) = listener.accept() {
+            let cfg = server_cfg.clone();
+            std::thread::spawn(move || serve_connection(sock, cfg));
+        }
+    });
 
     port
 }
