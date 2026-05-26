@@ -1,5 +1,8 @@
 pub mod response;
 
+#[cfg(feature = "registry")]
+pub mod registry;
+
 use std::sync::Arc;
 
 use crate::provider::response::ResponseCodec;
