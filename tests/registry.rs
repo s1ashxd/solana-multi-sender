@@ -163,3 +163,217 @@ mod registry_tests {
         assert_eq!(p.max_streams_uni, 64);
     }
 }
+
+#[cfg(feature = "registry")]
+mod smoke {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    use rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+    use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+
+    use tx_sender::job::{Job, ProviderId, MAX_TX_LEN};
+    use tx_sender::provider::registry;
+    use tx_sender::sink::{ProviderOutcome, ResultSink};
+    use tx_sender::source::TxSource;
+    use tx_sender::transport::sequential::Sequential;
+    use tx_sender::transport::Sender;
+
+    #[derive(Debug)]
+    struct AcceptAll;
+
+    impl ServerCertVerifier for AcceptAll {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer,
+            _: &[CertificateDer],
+            _: &ServerName,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    struct FixedTx;
+
+    impl TxSource for FixedTx {
+        fn fill(&self, _p: ProviderId, _j: Job, out: &mut [u8; MAX_TX_LEN]) -> u16 {
+            out[..4].copy_from_slice(&[1, 2, 3, 4]);
+            4
+        }
+    }
+
+    struct DropSink;
+
+    impl ResultSink for DropSink {
+        fn on_result(&self, _o: ProviderOutcome) {}
+    }
+
+    fn serve_connection(mut sock: std::net::TcpStream, server_cfg: Arc<rustls::ServerConfig>) {
+        use std::io::{Read, Write};
+
+        let mut conn = rustls::ServerConnection::new(server_cfg).unwrap();
+        let mut buf = [0u8; 8192];
+
+        while conn.is_handshaking() {
+            while conn.wants_write() {
+                let mut out = Vec::new();
+                conn.write_tls(&mut out).unwrap();
+                if sock.write_all(&out).is_err() {
+                    return;
+                }
+            }
+            if conn.is_handshaking() {
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let mut slice: &[u8] = &buf[..n];
+                if conn.read_tls(&mut slice).is_err() || conn.process_new_packets().is_err() {
+                    return;
+                }
+            }
+        }
+
+        while conn.wants_write() {
+            let mut out = Vec::new();
+            conn.write_tls(&mut out).unwrap();
+            if sock.write_all(&out).is_err() {
+                return;
+            }
+        }
+
+        let mut request_buf = Vec::new();
+        let drain_reader = |conn: &mut rustls::ServerConnection, req: &mut Vec<u8>| {
+            let mut tmp = [0u8; 8192];
+            loop {
+                match conn.reader().read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(m) => req.extend_from_slice(&tmp[..m]),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        };
+
+        drain_reader(&mut conn, &mut request_buf);
+        while request_buf.is_empty() {
+            let n = sock.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            let mut slice: &[u8] = &buf[..n];
+            if conn.read_tls(&mut slice).is_err() || conn.process_new_packets().is_err() {
+                return;
+            }
+            drain_reader(&mut conn, &mut request_buf);
+        }
+
+        let body = br#"{"jsonrpc":"2.0","result":"smoke-sig","id":1}"#;
+        let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let _ = conn.writer().write_all(resp.as_bytes());
+        let _ = conn.writer().write_all(body);
+
+        while conn.wants_write() {
+            let mut out = Vec::new();
+            conn.write_tls(&mut out).unwrap();
+            if sock.write_all(&out).is_err() {
+                return;
+            }
+        }
+        let _ = sock.flush();
+    }
+
+    fn spawn_tls_server() -> u16 {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = CertificateDer::from(certified.cert.der().to_vec());
+        let key_der =
+            rustls_pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
+
+        let server_cfg = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            while let Ok((sock, _)) = listener.accept() {
+                let cfg = server_cfg.clone();
+                std::thread::spawn(move || serve_connection(sock, cfg));
+            }
+        });
+
+        port
+    }
+
+    #[test]
+    fn builds_sender_from_jito_preset() {
+        let port = spawn_tls_server();
+
+        let client_cfg = Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAll))
+                .with_no_client_auth(),
+        );
+
+        let mut cfg = registry::jito_transaction("test-tok");
+        cfg.endpoint.host = "127.0.0.1".into();
+        cfg.endpoint.port = port;
+        cfg.endpoint.server_name = "localhost".into();
+
+        let sender = match Sender::builder()
+            .transport(Sequential::raw_libc())
+            .tls(client_cfg)
+            .provider(cfg)
+            .source(Arc::new(FixedTx))
+            .sink(Arc::new(DropSink))
+            .build()
+        {
+            Ok(s) => s,
+            Err(tx_sender::error::SenderError::Unsupported(e)) => {
+                eprintln!("transport unsupported on this kernel, skipping: {e}");
+                return;
+            }
+            Err(e) => panic!("{e:?}"),
+        };
+
+        sender.trigger(Job { id: 1, ctx: 0 }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        sender.shutdown();
+    }
+}
