@@ -1,3 +1,5 @@
+pub mod reconnect;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -108,6 +110,10 @@ impl QuicConn {
     pub fn drive(&mut self) {
         self.engine.drive(Instant::now());
     }
+
+    pub fn is_dead(&self) -> bool {
+        self.engine.is_closed()
+    }
 }
 
 pub enum ConnState<B: ByteIo> {
@@ -122,6 +128,43 @@ impl<B: ByteIo> ConnState<B> {
             ConnState::Quic(q) => q.drive(),
         }
     }
+}
+
+pub struct ConnSlot<C> {
+    pub conn: C,
+    pub healthy: bool,
+}
+
+pub struct DualConn<C> {
+    pub active: ConnSlot<C>,
+    pub standby: ConnSlot<C>,
+}
+
+impl<C> DualConn<C> {
+    pub fn new(active: C, standby: C) -> Self {
+        Self {
+            active: ConnSlot { conn: active, healthy: true },
+            standby: ConnSlot { conn: standby, healthy: true },
+        }
+    }
+
+    pub fn swap(&mut self) {
+        std::mem::swap(&mut self.active, &mut self.standby);
+        self.active.healthy = true;
+    }
+
+    pub fn replace_standby(&mut self, conn: C) {
+        self.standby.conn = conn;
+        self.standby.healthy = true;
+    }
+}
+
+pub fn http_conn_failed_io(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted
+    )
 }
 
 #[cfg(test)]
@@ -141,5 +184,30 @@ mod tests {
             is_http as fn(&ConnState<RawLibc>) -> bool,
             is_quic as fn(&ConnState<RawLibc>) -> bool,
         );
+    }
+
+    struct Dummy(u8);
+
+    #[test]
+    fn swap_makes_standby_active() {
+        let mut dc: DualConn<Dummy> = DualConn::new(Dummy(1), Dummy(2));
+        dc.swap();
+        assert_eq!(dc.active.conn.0, 2);
+        assert_eq!(dc.standby.conn.0, 1);
+    }
+
+    #[test]
+    fn replace_standby_resets_health() {
+        let mut dc: DualConn<Dummy> = DualConn::new(Dummy(1), Dummy(2));
+        dc.standby.healthy = false;
+        dc.replace_standby(Dummy(3));
+        assert!(dc.standby.healthy);
+        assert_eq!(dc.standby.conn.0, 3);
+    }
+
+    #[test]
+    fn http_failed_true_on_eof_false_on_wouldblock() {
+        assert!(http_conn_failed_io(&std::io::Error::from(std::io::ErrorKind::UnexpectedEof)));
+        assert!(!http_conn_failed_io(&std::io::Error::from(std::io::ErrorKind::WouldBlock)));
     }
 }
