@@ -238,6 +238,7 @@ fn failover_then_reconnect_keeps_serving() {
         quic_auth: None,
         auth: HttpAuth::None,
         max_body: 2000,
+        body_template: String::new(),
         codec: Arc::new(JsonRpcCodec),
     };
 

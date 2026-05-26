@@ -488,13 +488,30 @@ where
 }
 
 fn build_envelope(p: &ProviderConfig) -> crate::protocol::http::envelope::EnvelopeSpec {
-    let mut b = EnvelopeSpecBuilder::send_transaction(
+    use crate::protocol::http::spec_builder::AuthPlacement;
+    let auth = match &p.auth {
+        HttpAuth::None => AuthPlacement::None,
+        HttpAuth::Header { name, value } => AuthPlacement::Header {
+            name: name.clone(),
+            value: value.clone(),
+        },
+        HttpAuth::UrlParam { key, value } => AuthPlacement::UrlParam {
+            key,
+            value: value.clone(),
+        },
+        HttpAuth::UrlPath { token } => AuthPlacement::UrlPath {
+            token: token.clone(),
+        },
+    };
+    let mut b = EnvelopeSpecBuilder::new(
+        "POST",
         &p.endpoint.path,
         &p.endpoint.server_name,
         p.max_body,
-    );
-    if let HttpAuth::Header { name, value } = &p.auth {
-        b = b.header(name, value);
+    )
+    .auth_placement(auth);
+    if !p.body_template.is_empty() {
+        b = b.body_template(&p.body_template);
     }
     b.build()
 }

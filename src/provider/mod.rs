@@ -14,6 +14,8 @@ pub enum Protocol {
 pub enum HttpAuth {
     None,
     Header { name: String, value: String },
+    UrlParam { key: &'static str, value: String },
+    UrlPath { token: String },
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,7 @@ pub struct ProviderConfig {
     pub quic_auth: Option<QuicAuth>,
     pub auth: HttpAuth,
     pub max_body: usize,
+    pub body_template: String,
     pub codec: Arc<dyn ResponseCodec>,
 }
 

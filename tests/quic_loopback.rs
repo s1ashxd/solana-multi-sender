@@ -149,6 +149,7 @@ fn quic_send_and_noresp_outcome() {
         quic_auth: Some(QuicAuth::NoCert),
         auth: HttpAuth::None,
         max_body: 0,
+        body_template: String::new(),
         codec: Arc::new(JsonRpcCodec),
     };
 
