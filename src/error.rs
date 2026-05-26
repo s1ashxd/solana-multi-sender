@@ -6,6 +6,16 @@ pub enum TransportError {
     Quic(String),
     Envelope(EnvelopeError),
     Closed,
+    Failover,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failover_variant_exists() {
+        assert!(matches!(TransportError::Failover, TransportError::Failover));
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
