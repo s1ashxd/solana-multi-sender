@@ -36,6 +36,10 @@ pub enum Engine {
     ParRaw {
         cfg: crate::transport::parallel::ParallelConfig,
     },
+    #[cfg(feature = "libtpa")]
+    ParTpa {
+        cfg: crate::transport::parallel::ParallelConfig,
+    },
 }
 
 pub struct TransportSpec {
@@ -89,6 +93,8 @@ pub struct Sender {
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     reconnect: ReconnectThread,
+    #[cfg(feature = "libtpa")]
+    _tpa: Option<crate::backend::libtpa::TpaRuntime>,
 }
 
 impl Sender {
@@ -202,6 +208,9 @@ impl SenderBuilder {
             resp_rxs.push(r);
         }
 
+        #[cfg(feature = "libtpa")]
+        let mut tpa_runtime: Option<crate::backend::libtpa::TpaRuntime> = None;
+
         let (dispatch, mut workers, reconnect): (Dispatch, Vec<JoinHandle<()>>, ReconnectThread) =
             match spec.engine_kind {
                 Engine::SeqRaw => {
@@ -284,6 +293,29 @@ impl SenderBuilder {
                     );
                     (dispatch, handles, reconnect)
                 }
+                #[cfg(feature = "libtpa")]
+                Engine::ParTpa { cfg } => {
+                    let rt = crate::backend::libtpa::TpaRuntime::start(self.providers.len() as i32, 0)
+                        .map_err(|e| SenderError::Connect {
+                            provider: 0,
+                            source: e,
+                        })?;
+                    let builder = Box::new(TpaReconnectBuilder);
+                    let reconnect = ReconnectThread::spawn(builder, resp_txs, stop.clone());
+                    let req_tx = reconnect.sender();
+                    let (dispatch, handles) = spawn_parallel_tpa(
+                        self.providers.clone(),
+                        tls.clone(),
+                        source,
+                        cfg,
+                        result_tx,
+                        req_tx,
+                        resp_rxs,
+                        stop.clone(),
+                    );
+                    tpa_runtime = Some(rt);
+                    (dispatch, handles, reconnect)
+                }
             };
         workers.push(lane_handle);
 
@@ -292,6 +324,8 @@ impl SenderBuilder {
             stop,
             workers,
             reconnect,
+            #[cfg(feature = "libtpa")]
+            _tpa: tpa_runtime,
         })
     }
 }
@@ -480,6 +514,94 @@ where
                 let _ = crate::rt::set_sched_fifo(prio);
             }
             worker.run(worker_stop);
+        });
+        handles.push(handle);
+    }
+
+    (Dispatch::Fanout(trigger_txs), handles)
+}
+
+#[cfg(feature = "libtpa")]
+struct TpaReconnectBuilder;
+
+#[cfg(feature = "libtpa")]
+impl crate::conn::reconnect::ReconnectBuilder for TpaReconnectBuilder {
+    fn build(
+        &self,
+        _provider_idx: usize,
+        _kind: ConnKind,
+    ) -> Result<crate::conn::reconnect::ConnBox, crate::conn::reconnect::ReconnectError> {
+        Err(crate::conn::reconnect::ReconnectError::NotSupported)
+    }
+}
+
+#[cfg(feature = "libtpa")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_parallel_tpa(
+    providers: Vec<ProviderConfig>,
+    tls: Arc<ClientConfig>,
+    source: Arc<dyn TxSource>,
+    cfg: crate::transport::parallel::ParallelConfig,
+    result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
+    reconnect_req_tx: crossbeam_channel::Sender<crate::conn::reconnect::ReconnectReq>,
+    reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
+    stop: Arc<AtomicBool>,
+) -> (Dispatch, Vec<JoinHandle<()>>) {
+    use crate::backend::libtpa::LibTpa;
+    use crate::transport::parallel::ParWorker;
+
+    let core_ids: Vec<usize> = cfg
+        .affinity
+        .as_ref()
+        .map(|c| c.ids().to_vec())
+        .unwrap_or_default();
+    let rt_priority = cfg.rt.priority;
+
+    let mut trigger_txs = Vec::with_capacity(providers.len());
+    let mut handles = Vec::with_capacity(providers.len());
+
+    for ((i, res_tx), resp_rx) in result_tx.into_iter().enumerate().zip(reconnect_resp_rx) {
+        let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+        trigger_txs.push(trig_tx);
+
+        let providers_t = providers.clone();
+        let tls_t = tls.clone();
+        let source_t = source.clone();
+        let req_tx_t = reconnect_req_tx.clone();
+        let stop_t = stop.clone();
+        let core_id = core_ids.get(i).copied();
+
+        let handle = std::thread::spawn(move || {
+            if let Some(id) = core_id {
+                crate::rt::pin_current_thread(id);
+            }
+            if let Some(prio) = rt_priority {
+                let _ = crate::rt::set_sched_fifo(prio);
+            }
+            let mut probe = LibTpa::new();
+            if probe.attach_worker().is_err() {
+                return;
+            }
+            let worker_ptr = probe.worker();
+            let make = move |_| Ok(LibTpa::with_worker(worker_ptr));
+            let Ok(active) = connect_one::<LibTpa, _>(&providers_t, i, &tls_t, &make) else {
+                return;
+            };
+            let Ok(standby) = connect_one::<LibTpa, _>(&providers_t, i, &tls_t, &make) else {
+                return;
+            };
+            let dual = DualConn::new(active, standby);
+            let worker = ParWorker::new(
+                i,
+                trig_rx,
+                res_tx,
+                source_t,
+                dual,
+                req_tx_t,
+                resp_rx,
+                ConnKind::LibTpa,
+            );
+            worker.run(stop_t);
         });
         handles.push(handle);
     }
