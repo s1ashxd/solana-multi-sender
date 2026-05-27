@@ -156,6 +156,40 @@ pub fn udp_sendto(fd: RawFd, dst: SocketAddr, buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+pub fn udp_sendmsg_gso(fd: RawFd, dst: SocketAddr, bytes: &[u8], segment_size: u16) -> io::Result<()> {
+    const UDP_SEGMENT: libc::c_int = 103;
+    let (storage, sa_len) = sockaddr_of(dst);
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    mhdr.msg_name = std::ptr::addr_of!(storage) as *mut libc::c_void;
+    mhdr.msg_namelen = sa_len;
+    mhdr.msg_iov = &mut iov;
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    mhdr.msg_controllen = cmsg_space as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&mhdr);
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = UDP_SEGMENT;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+        std::ptr::write(libc::CMSG_DATA(cmsg) as *mut u16, segment_size);
+    }
+    let n = unsafe { libc::sendmsg(fd, &mhdr, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub(crate) fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let sa_len = match addr {
@@ -181,4 +215,41 @@ pub(crate) fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::so
         }
     };
     (storage, sa_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn gso_single_segment_loopback() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let recv_addr = receiver.local_addr().unwrap();
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = sender.as_raw_fd();
+
+        udp_sendmsg_gso(fd, recv_addr, b"hello", 1280).unwrap();
+
+        let mut buf = [0u8; 64];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match receiver.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    assert_eq!(&buf[..n], b"hello");
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        panic!("timed out waiting for gso datagram");
+                    }
+                }
+                Err(e) => panic!("recv failed: {e}"),
+            }
+        }
+    }
 }
