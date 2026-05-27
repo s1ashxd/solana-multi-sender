@@ -132,11 +132,27 @@ impl EnvelopeTemplate {
             let cl_off_usize = cl_off as usize;
             let cl_width = self.cl_width as usize;
             let http_body_len = real_len - self.http_body_start as usize;
-            let digits = format!("{http_body_len}");
-            if digits.len() > cl_width {
-                return Err(EnvelopeError::ContentLengthOverflow { value: http_body_len, width: self.cl_width });
+
+            let mut scratch = [0u8; 20];
+            let mut n = http_body_len;
+            let mut pos = scratch.len();
+            loop {
+                pos -= 1;
+                scratch[pos] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
             }
-            self.out[cl_off_usize..cl_off_usize + digits.len()].copy_from_slice(digits.as_bytes());
+            let digits = &scratch[pos..];
+
+            if digits.len() > cl_width {
+                return Err(EnvelopeError::ContentLengthOverflow {
+                    value: http_body_len,
+                    width: self.cl_width,
+                });
+            }
+            self.out[cl_off_usize..cl_off_usize + digits.len()].copy_from_slice(digits);
             for b in &mut self.out[cl_off_usize + digits.len()..cl_off_usize + cl_width] {
                 *b = b' ';
             }

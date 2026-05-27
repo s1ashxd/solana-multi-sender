@@ -36,3 +36,8 @@ dhat = "0.3"
 [[bench]]
 name = "trigger_submit"
 harness = false
+
+[[test]]
+name = "dhat_zero_alloc"
+path = "tests/dhat_zero_alloc.rs"
+required-features = ["dhat-heap"]
