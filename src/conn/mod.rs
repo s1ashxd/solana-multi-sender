@@ -51,9 +51,9 @@ impl<B: ByteIo> HttpConn<B> {
     }
 
     pub fn send_tx(&mut self, tx: &[u8]) -> Result<(), TransportError> {
-        let cipher = self.engine.encode(tx)?.to_vec();
+        let cipher = self.engine.encode(tx)?;
         self.io
-            .submit(&mut self.raw, Wire::Stream, &cipher)
+            .submit(&mut self.raw, Wire::Stream, cipher)
             .map_err(TransportError::Io)
     }
 
