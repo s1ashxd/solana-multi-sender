@@ -3,6 +3,9 @@ pub mod raw_libc;
 #[cfg(feature = "io-uring")]
 pub mod io_uring;
 
+#[cfg(feature = "libtpa")]
+pub mod libtpa;
+
 use std::net::SocketAddr;
 
 pub enum Wire {

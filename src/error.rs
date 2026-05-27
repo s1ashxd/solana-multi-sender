@@ -7,6 +7,7 @@ pub enum TransportError {
     Envelope(EnvelopeError),
     Closed,
     Failover,
+    Tpa(i32),
 }
 
 #[cfg(test)]
