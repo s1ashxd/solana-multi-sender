@@ -61,6 +61,18 @@ impl Parallel<RawLibc> {
     }
 }
 
+#[cfg(feature = "libtpa")]
+impl Parallel<crate::backend::libtpa::LibTpa> {
+    #[must_use]
+    pub fn libtpa() -> TransportSpec {
+        TransportSpec {
+            engine_kind: Engine::ParTpa {
+                cfg: ParallelConfig::default(),
+            },
+        }
+    }
+}
+
 const PERIODIC_MASK: u32 = 0x3FF;
 
 pub struct ParWorker<B: ParBackend> {

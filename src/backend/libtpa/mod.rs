@@ -69,6 +69,11 @@ impl LibTpa {
         }
     }
 
+    #[must_use]
+    pub fn with_worker(worker: *mut ffi::tpa_worker) -> Self {
+        Self { worker }
+    }
+
     pub fn attach_worker(&mut self) -> Result<(), TransportError> {
         let worker = unsafe { ffi::tpa_worker_init() };
         if worker.is_null() {
@@ -76,6 +81,11 @@ impl LibTpa {
         }
         self.worker = worker;
         Ok(())
+    }
+
+    #[must_use]
+    pub fn worker(&self) -> *mut ffi::tpa_worker {
+        self.worker
     }
 
     pub fn connect_tcp(&mut self, host: &str, port: u16) -> Result<TpaConn, TransportError> {
