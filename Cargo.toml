@@ -24,7 +24,7 @@ default = ["registry", "io-uring"]
 registry = []
 io-uring = ["dep:io-uring"]
 libtpa = []
-profiling = []
+profiling = ["low-latency-utils/profiling"]
 dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]

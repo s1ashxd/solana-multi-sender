@@ -1,3 +1,4 @@
+pub mod health;
 pub mod parallel;
 pub mod sequential;
 
@@ -88,11 +89,15 @@ enum Dispatch {
     Fanout(Vec<SpscProducer<Job, TRIGGER_RING>>),
 }
 
+pub(crate) type DiagSlot =
+    std::sync::Arc<low_latency_utils::SharedDiagnostics<crate::transport::health::WorkerDiag>>;
+
 pub struct Sender {
     dispatch: Dispatch,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     reconnect: ReconnectThread,
+    diag: Vec<DiagSlot>,
     #[cfg(feature = "libtpa")]
     _tpa: Option<crate::backend::libtpa::TpaRuntime>,
 }
@@ -140,6 +145,25 @@ impl Sender {
             let _ = w.join();
         }
         self.reconnect.join();
+    }
+
+    pub fn health(&self) -> crate::transport::health::ProviderHealthSnapshot {
+        let providers = self
+            .diag
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let w = d.read_latest().unwrap_or_default();
+                crate::transport::health::ProviderHealthEntry {
+                    provider_idx: i,
+                    alive: w.alive,
+                    jobs_sent: w.jobs_sent,
+                    fill_ns: w.fill_ns,
+                    submit_ns: w.submit_ns,
+                }
+            })
+            .collect();
+        crate::transport::health::ProviderHealthSnapshot { providers }
     }
 }
 
@@ -200,6 +224,13 @@ impl SenderBuilder {
         let lane_handle = std::thread::spawn(move || lane.run(&lane_stop));
 
         let n = self.providers.len();
+        let diag: Vec<DiagSlot> = (0..n)
+            .map(|_| {
+                std::sync::Arc::new(low_latency_utils::SharedDiagnostics::new(
+                    crate::transport::health::WorkerDiag::default(),
+                ))
+            })
+            .collect();
         let mut resp_txs = Vec::with_capacity(n);
         let mut resp_rxs = Vec::with_capacity(n);
         for _ in 0..n {
@@ -235,6 +266,7 @@ impl SenderBuilder {
                         resp_rxs,
                         ConnKind::RawLibc,
                         stop.clone(),
+                        diag.clone(),
                     );
                     (Dispatch::Single(trig_tx), vec![h], reconnect)
                 }
@@ -267,6 +299,7 @@ impl SenderBuilder {
                         resp_rxs,
                         ConnKind::IoUring,
                         stop.clone(),
+                        diag.clone(),
                     );
                     (Dispatch::Single(trig_tx), vec![h], reconnect)
                 }
@@ -290,6 +323,7 @@ impl SenderBuilder {
                         resp_rxs,
                         ConnKind::RawLibc,
                         stop.clone(),
+                        diag.clone(),
                     );
                     (dispatch, handles, reconnect)
                 }
@@ -312,6 +346,7 @@ impl SenderBuilder {
                         req_tx,
                         resp_rxs,
                         stop.clone(),
+                        diag.clone(),
                     );
                     tpa_runtime = Some(rt);
                     (dispatch, handles, reconnect)
@@ -324,6 +359,7 @@ impl SenderBuilder {
             stop,
             workers,
             reconnect,
+            diag,
             #[cfg(feature = "libtpa")]
             _tpa: tpa_runtime,
         })
@@ -444,6 +480,7 @@ fn spawn_seq<B>(
     reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
     conn_kind: ConnKind,
     stop: Arc<AtomicBool>,
+    diag: Vec<DiagSlot>,
 ) -> JoinHandle<()>
 where
     B: crate::backend::SeqBackend + Send + 'static,
@@ -457,6 +494,7 @@ where
         reconnect_req_tx,
         reconnect_resp_rx,
         conn_kind,
+        diag,
     );
     std::thread::spawn(move || worker.run(stop))
 }
@@ -471,6 +509,7 @@ fn spawn_parallel<B>(
     reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
     conn_kind: ConnKind,
     stop: Arc<AtomicBool>,
+    diag: Vec<DiagSlot>,
 ) -> (Dispatch, Vec<JoinHandle<()>>)
 where
     B: crate::backend::ParBackend + Send + 'static,
@@ -506,6 +545,7 @@ where
             reconnect_req_tx.clone(),
             resp_rx,
             conn_kind,
+            diag[i].clone(),
         );
         let core_id = core_ids.get(i).copied();
         let worker_stop = stop.clone();
@@ -549,6 +589,7 @@ fn spawn_parallel_tpa(
     reconnect_req_tx: crossbeam_channel::Sender<crate::conn::reconnect::ReconnectReq>,
     reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
     stop: Arc<AtomicBool>,
+    diag: Vec<DiagSlot>,
 ) -> (Dispatch, Vec<JoinHandle<()>>) {
     use crate::backend::libtpa::LibTpa;
     use crate::transport::parallel::ParWorker;
@@ -572,6 +613,7 @@ fn spawn_parallel_tpa(
         let source_t = source.clone();
         let req_tx_t = reconnect_req_tx.clone();
         let stop_t = stop.clone();
+        let diag_t = diag[i].clone();
         let core_id = core_ids.get(i).copied();
 
         let handle = std::thread::spawn(move || {
@@ -603,6 +645,7 @@ fn spawn_parallel_tpa(
                 req_tx_t,
                 resp_rx,
                 ConnKind::LibTpa,
+                diag_t,
             );
             worker.run(stop_t);
         });

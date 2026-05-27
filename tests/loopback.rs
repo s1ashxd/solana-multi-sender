@@ -126,6 +126,10 @@ fn run_case(spec: TransportSpec) {
         other => panic!("{other:?}"),
     }
 
+    let health = sender.health();
+    assert_eq!(health.providers.len(), 1);
+    assert_eq!(health.providers[0].provider_idx, 0);
+
     sender.shutdown();
 }
 

@@ -14,7 +14,8 @@ use crate::job::Job;
 use crate::result_lane::{RawResp, RESP_CAP, RESULT_RING};
 use crate::sink::OutcomeKind;
 use crate::source::TxSource;
-use crate::transport::{Engine, TransportSpec};
+use crate::transport::health::WorkerDiag;
+use crate::transport::{DiagSlot, Engine, TransportSpec};
 use crossbeam_channel::{Receiver, Sender};
 
 pub const TRIGGER_RING: usize = 256;
@@ -31,9 +32,18 @@ pub struct SequentialWorker<B: SeqBackend> {
     pub reconnect_resp_rx: Vec<Receiver<ReconnectResp>>,
     pub conn_kind: ConnKind,
     tick: u32,
+    diag: Vec<DiagSlot>,
+    jobs_sent: Vec<u64>,
+    #[cfg(feature = "profiling")]
+    profiler: low_latency_utils::Profiler,
+    #[cfg(feature = "profiling")]
+    fill_stat: Vec<low_latency_utils::LatencyStat>,
+    #[cfg(feature = "profiling")]
+    submit_stat: Vec<low_latency_utils::LatencyStat>,
 }
 
 impl<B: SeqBackend + 'static> SequentialWorker<B> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         trigger: SpscConsumer<Job, TRIGGER_RING>,
         conns: Vec<DualConn<ConnState<B>>>,
@@ -42,8 +52,10 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
         reconnect_req_tx: Sender<ReconnectReq>,
         reconnect_resp_rx: Vec<Receiver<ReconnectResp>>,
         conn_kind: ConnKind,
+        diag: Vec<DiagSlot>,
     ) -> Self {
-        let inflight = (0..conns.len()).map(|_| None).collect();
+        let n = conns.len();
+        let inflight = (0..n).map(|_| None).collect();
         Self {
             trigger,
             conns,
@@ -54,6 +66,14 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
             reconnect_resp_rx,
             conn_kind,
             tick: 0,
+            diag,
+            jobs_sent: vec![0; n],
+            #[cfg(feature = "profiling")]
+            profiler: low_latency_utils::Profiler::new(),
+            #[cfg(feature = "profiling")]
+            fill_stat: (0..n).map(|_| low_latency_utils::LatencyStat::new()).collect(),
+            #[cfg(feature = "profiling")]
+            submit_stat: (0..n).map(|_| low_latency_utils::LatencyStat::new()).collect(),
         }
     }
 
@@ -64,7 +84,14 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
                 let sent = rdtsc();
                 for i in 0..self.conns.len() {
                     let pid = crate::job::ProviderId(i as u16);
+                    #[cfg(feature = "profiling")]
+                    let t0 = self.profiler.mark();
                     let len = self.source.fill(pid, job, &mut scratch);
+                    #[cfg(feature = "profiling")]
+                    {
+                        let t1 = self.profiler.mark();
+                        self.fill_stat[i].record(self.profiler.elapsed(t0, t1));
+                    }
                     let end = usize::from(len);
                     self.send_to(i, job, sent, end, &scratch, pid);
                 }
@@ -79,6 +106,7 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
             self.tick = self.tick.wrapping_add(1);
             if self.tick & PERIODIC_MASK == 0 {
                 self.check_standby_deliveries();
+                self.publish_diag();
             }
             if self.trigger.is_empty() {
                 unsafe {
@@ -87,6 +115,7 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
                     });
                 }
                 self.check_standby_deliveries();
+                self.publish_diag();
             }
         }
     }
@@ -101,14 +130,20 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
         pid: crate::job::ProviderId,
     ) {
         let tx = &scratch[..end];
+        #[cfg(feature = "profiling")]
+        let t0 = self.profiler.mark();
         match &mut self.conns[i].active.conn {
             ConnState::Http(h) => match h.send_tx(tx) {
-                Ok(()) => self.inflight[i] = Some((job, sent)),
+                Ok(()) => {
+                    self.inflight[i] = Some((job, sent));
+                    self.jobs_sent[i] += 1;
+                }
                 Err(TransportError::Io(ref e)) if http_conn_failed_io(e) => {
                     self.do_failover(i);
                     if let ConnState::Http(h2) = &mut self.conns[i].active.conn {
                         if h2.send_tx(tx).is_ok() {
                             self.inflight[i] = Some((job, sent));
+                            self.jobs_sent[i] += 1;
                         }
                     }
                 }
@@ -116,7 +151,13 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
             },
             ConnState::Quic(q) => {
                 let _ = q.send_tx(job, sent, tx);
+                self.jobs_sent[i] += 1;
             }
+        }
+        #[cfg(feature = "profiling")]
+        {
+            let t1 = self.profiler.mark();
+            self.submit_stat[i].record(self.profiler.elapsed(t0, t1));
         }
         let _ = pid;
     }
@@ -174,6 +215,24 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
                     self.conns[resp.provider_idx].replace_standby(*new_conn);
                 }
             }
+        }
+    }
+
+    fn publish_diag(&self) {
+        for i in 0..self.diag.len() {
+            #[cfg(feature = "profiling")]
+            let (fill_ns, submit_ns) = (self.fill_stat[i].snapshot(), self.submit_stat[i].snapshot());
+            #[cfg(not(feature = "profiling"))]
+            let (fill_ns, submit_ns) = (
+                low_latency_utils::StatSnapshot::default(),
+                low_latency_utils::StatSnapshot::default(),
+            );
+            self.diag[i].publish(WorkerDiag {
+                alive: true,
+                jobs_sent: self.jobs_sent[i],
+                fill_ns,
+                submit_ns,
+            });
         }
     }
 }

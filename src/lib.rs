@@ -17,6 +17,7 @@ pub mod prelude {
     pub use crate::source::TxSource;
     pub use crate::transport::parallel::{CoreSet, Parallel, ParallelConfig, RtConfig};
     pub use crate::transport::sequential::Sequential;
+    pub use crate::transport::health::ProviderHealthSnapshot;
     pub use crate::transport::{Sender, SenderBuilder, TransportSpec};
     #[cfg(feature = "io-uring")]
     pub use crate::backend::io_uring::{IoUringMode, IoUringTuning, SqpollCfg};

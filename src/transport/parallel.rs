@@ -14,8 +14,9 @@ use crate::job::{Job, ProviderId, MAX_TX_LEN};
 use crate::result_lane::{RawResp, RESP_CAP, RESULT_RING};
 use crate::sink::OutcomeKind;
 use crate::source::TxSource;
+use crate::transport::health::WorkerDiag;
 use crate::transport::sequential::TRIGGER_RING;
-use crate::transport::{Engine, TransportSpec};
+use crate::transport::{DiagSlot, Engine, TransportSpec};
 use crossbeam_channel::{Receiver, Sender};
 
 #[derive(Clone, Default)]
@@ -86,6 +87,14 @@ pub struct ParWorker<B: ParBackend> {
     pub reconnect_resp_rx: Receiver<ReconnectResp>,
     pub conn_kind: ConnKind,
     tick: u32,
+    diag: DiagSlot,
+    jobs_sent: u64,
+    #[cfg(feature = "profiling")]
+    profiler: low_latency_utils::Profiler,
+    #[cfg(feature = "profiling")]
+    fill_stat: low_latency_utils::LatencyStat,
+    #[cfg(feature = "profiling")]
+    submit_stat: low_latency_utils::LatencyStat,
 }
 
 impl<B: ParBackend + 'static> ParWorker<B> {
@@ -99,6 +108,7 @@ impl<B: ParBackend + 'static> ParWorker<B> {
         reconnect_req_tx: Sender<ReconnectReq>,
         reconnect_resp_rx: Receiver<ReconnectResp>,
         conn_kind: ConnKind,
+        diag: DiagSlot,
     ) -> Self {
         Self {
             provider_idx,
@@ -111,6 +121,14 @@ impl<B: ParBackend + 'static> ParWorker<B> {
             reconnect_resp_rx,
             conn_kind,
             tick: 0,
+            diag,
+            jobs_sent: 0,
+            #[cfg(feature = "profiling")]
+            profiler: low_latency_utils::Profiler::new(),
+            #[cfg(feature = "profiling")]
+            fill_stat: low_latency_utils::LatencyStat::new(),
+            #[cfg(feature = "profiling")]
+            submit_stat: low_latency_utils::LatencyStat::new(),
         }
     }
 
@@ -120,7 +138,14 @@ impl<B: ParBackend + 'static> ParWorker<B> {
         while !stop.load(Ordering::Relaxed) {
             if let Some(job) = self.trigger.try_pop() {
                 let sent = rdtsc();
+                #[cfg(feature = "profiling")]
+                let t0 = self.profiler.mark();
                 let len = self.source.fill(pid, job, &mut scratch);
+                #[cfg(feature = "profiling")]
+                {
+                    let t1 = self.profiler.mark();
+                    self.fill_stat.record(self.profiler.elapsed(t0, t1));
+                }
                 let end = usize::from(len);
                 self.send_to(job, sent, end, &scratch);
             }
@@ -129,6 +154,7 @@ impl<B: ParBackend + 'static> ParWorker<B> {
             self.tick = self.tick.wrapping_add(1);
             if self.tick & PERIODIC_MASK == 0 {
                 self.check_standby_delivery();
+                self.publish_diag();
             }
             if self.trigger.is_empty() {
                 unsafe {
@@ -137,20 +163,27 @@ impl<B: ParBackend + 'static> ParWorker<B> {
                     });
                 }
                 self.check_standby_delivery();
+                self.publish_diag();
             }
         }
     }
 
     fn send_to(&mut self, job: Job, sent: u64, end: usize, scratch: &[u8]) {
         let tx = &scratch[..end];
+        #[cfg(feature = "profiling")]
+        let t0 = self.profiler.mark();
         match &mut self.dual_conn.active.conn {
             ConnState::Http(h) => match h.send_tx(tx) {
-                Ok(()) => self.inflight = Some((job, sent)),
+                Ok(()) => {
+                    self.inflight = Some((job, sent));
+                    self.jobs_sent += 1;
+                }
                 Err(TransportError::Io(ref e)) if http_conn_failed_io(e) => {
                     self.do_failover();
                     if let ConnState::Http(h2) = &mut self.dual_conn.active.conn {
                         if h2.send_tx(tx).is_ok() {
                             self.inflight = Some((job, sent));
+                            self.jobs_sent += 1;
                         }
                     }
                 }
@@ -158,7 +191,13 @@ impl<B: ParBackend + 'static> ParWorker<B> {
             },
             ConnState::Quic(q) => {
                 let _ = q.send_tx(job, sent, tx);
+                self.jobs_sent += 1;
             }
+        }
+        #[cfg(feature = "profiling")]
+        {
+            let t1 = self.profiler.mark();
+            self.submit_stat.record(self.profiler.elapsed(t0, t1));
         }
     }
 
@@ -215,6 +254,22 @@ impl<B: ParBackend + 'static> ParWorker<B> {
                 self.dual_conn.replace_standby(*new_conn);
             }
         }
+    }
+
+    fn publish_diag(&self) {
+        #[cfg(feature = "profiling")]
+        let (fill_ns, submit_ns) = (self.fill_stat.snapshot(), self.submit_stat.snapshot());
+        #[cfg(not(feature = "profiling"))]
+        let (fill_ns, submit_ns) = (
+            low_latency_utils::StatSnapshot::default(),
+            low_latency_utils::StatSnapshot::default(),
+        );
+        self.diag.publish(WorkerDiag {
+            alive: true,
+            jobs_sent: self.jobs_sent,
+            fill_ns,
+            submit_ns,
+        });
     }
 }
 
