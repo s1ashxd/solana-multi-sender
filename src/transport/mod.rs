@@ -344,7 +344,10 @@ where
     match p.protocol {
         Protocol::Http => {
             let spec = build_envelope(p);
-            let tpl = spec.compile().expect("envelope compiles");
+            let tpl = spec.compile().map_err(|e| SenderError::Connect {
+                provider: i as u16,
+                source: crate::error::TransportError::Envelope(e),
+            })?;
             let io = make(i)?;
             let conn = HttpConn::connect_with(io, p, tls.clone(), tpl).map_err(|e| {
                 SenderError::Connect {
