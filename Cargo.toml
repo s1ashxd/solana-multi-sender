@@ -17,13 +17,22 @@ rcgen = "0.13"
 io-uring = { version = "0.7", optional = true }
 crossbeam-channel = "0.5"
 webpki-roots = "0.26"
+dhat = { version = "0.3", optional = true }
 
 [features]
 default = ["registry", "io-uring"]
 registry = []
 io-uring = ["dep:io-uring"]
 libtpa = []
+profiling = []
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+dhat = "0.3"
+
+[[bench]]
+name = "trigger_submit"
+harness = false
