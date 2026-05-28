@@ -1,3 +1,13 @@
+pub mod spsc;
+#[cfg(target_arch = "x86_64")]
+pub mod wait;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 use std::io;
 
 pub fn pin_current_thread(core_id: usize) -> bool {

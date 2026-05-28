@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use low_latency_utils::tsc::rdtsc;
-use low_latency_utils::{SpscConsumer, SpscProducer};
+use crate::rt::rdtsc;
+use crate::rt::spsc::{Consumer as SpscConsumer, Producer as SpscProducer};
 
 use crate::backend::raw_libc::RawLibc;
 use crate::backend::ParBackend;
@@ -11,11 +11,10 @@ use crate::conn::reconnect::{ConnKind, ReconnectReq, ReconnectResp};
 use crate::conn::{http_conn_failed_io, ConnState, DualConn};
 use crate::error::TransportError;
 use crate::job::{Job, ProviderId, MAX_TX_LEN};
-use crate::result_lane::{RawResp, RESP_CAP, RESULT_RING};
+use crate::result_lane::{RawResp, RESP_CAP};
 use crate::sink::OutcomeKind;
 use crate::source::TxSource;
 use crate::transport::health::WorkerDiag;
-use crate::transport::sequential::TRIGGER_RING;
 use crate::transport::{DiagSlot, Engine, TransportSpec};
 use crossbeam_channel::{Receiver, Sender};
 
@@ -78,8 +77,8 @@ const PERIODIC_MASK: u32 = 0x3FF;
 
 pub struct ParWorker<B: ParBackend> {
     pub provider_idx: usize,
-    pub trigger: SpscConsumer<Job, TRIGGER_RING>,
-    pub result_tx: SpscProducer<RawResp, RESULT_RING>,
+    pub trigger: SpscConsumer<Job>,
+    pub result_tx: SpscProducer<RawResp>,
     pub source: Arc<dyn TxSource>,
     pub dual_conn: DualConn<ConnState<B>>,
     pub inflight: Option<(Job, u64)>,
@@ -90,19 +89,19 @@ pub struct ParWorker<B: ParBackend> {
     diag: DiagSlot,
     jobs_sent: u64,
     #[cfg(feature = "profiling")]
-    profiler: low_latency_utils::Profiler,
+    profiler: quanta::Clock,
     #[cfg(feature = "profiling")]
-    fill_stat: low_latency_utils::LatencyStat,
+    fill_stat: hdrhistogram::Histogram<u64>,
     #[cfg(feature = "profiling")]
-    submit_stat: low_latency_utils::LatencyStat,
+    submit_stat: hdrhistogram::Histogram<u64>,
 }
 
 impl<B: ParBackend + 'static> ParWorker<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider_idx: usize,
-        trigger: SpscConsumer<Job, TRIGGER_RING>,
-        result_tx: SpscProducer<RawResp, RESULT_RING>,
+        trigger: SpscConsumer<Job>,
+        result_tx: SpscProducer<RawResp>,
         source: Arc<dyn TxSource>,
         dual_conn: DualConn<ConnState<B>>,
         reconnect_req_tx: Sender<ReconnectReq>,
@@ -124,11 +123,11 @@ impl<B: ParBackend + 'static> ParWorker<B> {
             diag,
             jobs_sent: 0,
             #[cfg(feature = "profiling")]
-            profiler: low_latency_utils::Profiler::new(),
+            profiler: quanta::Clock::new(),
             #[cfg(feature = "profiling")]
-            fill_stat: low_latency_utils::LatencyStat::new(),
+            fill_stat: hdrhistogram::Histogram::<u64>::new(3).expect("hdrhistogram"),
             #[cfg(feature = "profiling")]
-            submit_stat: low_latency_utils::LatencyStat::new(),
+            submit_stat: hdrhistogram::Histogram::<u64>::new(3).expect("hdrhistogram"),
         }
     }
 
@@ -139,12 +138,12 @@ impl<B: ParBackend + 'static> ParWorker<B> {
             if let Some(job) = self.trigger.try_pop() {
                 let sent = rdtsc();
                 #[cfg(feature = "profiling")]
-                let t0 = self.profiler.mark();
+                let t0 = self.profiler.raw();
                 let len = self.source.fill(pid, job, &mut scratch);
                 #[cfg(feature = "profiling")]
                 {
-                    let t1 = self.profiler.mark();
-                    self.fill_stat.record(self.profiler.elapsed(t0, t1));
+                    let t1 = self.profiler.raw();
+                    self.fill_stat.record(self.profiler.delta_as_nanos(t0, t1)).ok();
                 }
                 let end = usize::from(len);
                 self.send_to(job, sent, end, &scratch);
@@ -158,7 +157,7 @@ impl<B: ParBackend + 'static> ParWorker<B> {
             }
             if self.trigger.is_empty() {
                 unsafe {
-                    low_latency_utils::wait::idle_wait(self.trigger.tail_ptr(), || {
+                    crate::rt::wait::idle_wait(self.trigger.monitor_addr(), || {
                         self.trigger.is_empty() && !stop.load(Ordering::Relaxed)
                     });
                 }
@@ -171,7 +170,7 @@ impl<B: ParBackend + 'static> ParWorker<B> {
     fn send_to(&mut self, job: Job, sent: u64, end: usize, scratch: &[u8]) {
         let tx = &scratch[..end];
         #[cfg(feature = "profiling")]
-        let t0 = self.profiler.mark();
+        let t0 = self.profiler.raw();
         match &mut self.dual_conn.active.conn {
             ConnState::Http(h) => match h.send_tx(tx) {
                 Ok(()) => {
@@ -196,8 +195,8 @@ impl<B: ParBackend + 'static> ParWorker<B> {
         }
         #[cfg(feature = "profiling")]
         {
-            let t1 = self.profiler.mark();
-            self.submit_stat.record(self.profiler.elapsed(t0, t1));
+            let t1 = self.profiler.raw();
+            self.submit_stat.record(self.profiler.delta_as_nanos(t0, t1)).ok();
         }
     }
 
@@ -258,18 +257,21 @@ impl<B: ParBackend + 'static> ParWorker<B> {
 
     fn publish_diag(&self) {
         #[cfg(feature = "profiling")]
-        let (fill_ns, submit_ns) = (self.fill_stat.snapshot(), self.submit_stat.snapshot());
+        let (fill_ns, submit_ns) = (
+            crate::transport::health::hist_snap(&self.fill_stat),
+            crate::transport::health::hist_snap(&self.submit_stat),
+        );
         #[cfg(not(feature = "profiling"))]
         let (fill_ns, submit_ns) = (
-            low_latency_utils::StatSnapshot::default(),
-            low_latency_utils::StatSnapshot::default(),
+            crate::transport::health::HistSnapshot::default(),
+            crate::transport::health::HistSnapshot::default(),
         );
-        self.diag.publish(WorkerDiag {
+        *self.diag.lock_write() = WorkerDiag {
             alive: true,
             jobs_sent: self.jobs_sent,
             fill_ns,
             submit_ns,
-        });
+        };
     }
 }
 

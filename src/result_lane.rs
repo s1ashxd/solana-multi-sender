@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
-use low_latency_utils::SpscConsumer;
+use crate::rt::spsc::Consumer as SpscConsumer;
 
 use crate::job::{JobId, ProviderId};
 use crate::provider::response::ResponseCodec;
@@ -55,7 +55,7 @@ pub(crate) fn parse_one(resp: &RawResp, codec: &dyn ResponseCodec) -> ProviderOu
 }
 
 pub struct ResultLane {
-    rings: Vec<SpscConsumer<RawResp, RESULT_RING>>,
+    rings: Vec<SpscConsumer<RawResp>>,
     codecs: Vec<Arc<dyn ResponseCodec>>,
     sink: Arc<dyn ResultSink>,
 }
@@ -63,18 +63,18 @@ pub struct ResultLane {
 impl ResultLane {
     #[must_use]
     pub fn new(
-        rings: Vec<SpscConsumer<RawResp, RESULT_RING>>,
+        rings: Vec<SpscConsumer<RawResp>>,
         codecs: Vec<Arc<dyn ResponseCodec>>,
         sink: Arc<dyn ResultSink>,
     ) -> Self {
         Self { rings, codecs, sink }
     }
 
-    pub fn run(&self, stop: &std::sync::atomic::AtomicBool) {
+    pub fn run(&mut self, stop: &std::sync::atomic::AtomicBool) {
         use std::sync::atomic::Ordering;
         while !stop.load(Ordering::Relaxed) {
             let mut got = false;
-            for (i, ring) in self.rings.iter().enumerate() {
+            for (i, ring) in self.rings.iter_mut().enumerate() {
                 while let Some(resp) = ring.try_pop() {
                     got = true;
                     let outcome = parse_one(&resp, self.codecs[i].as_ref());
@@ -83,7 +83,11 @@ impl ResultLane {
             }
             if !got {
                 if let Some(first) = self.rings.first() {
-                    unsafe { low_latency_utils::wait::idle_wait(first.tail_ptr(), || first.is_empty() && !stop.load(std::sync::atomic::Ordering::Relaxed)) };
+                    unsafe {
+                        crate::rt::wait::idle_wait(first.monitor_addr(), || {
+                            first.is_empty() && !stop.load(Ordering::Relaxed)
+                        });
+                    }
                 }
             }
         }

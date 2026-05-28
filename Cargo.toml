@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-low-latency-utils = { path = "../low-latency-utils" }
+rtrb = "0.3"
+seqlock = "0.2"
+hdrhistogram = { version = "7", optional = true }
+quanta = { version = "0.12", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 base64-simd = "0.8"
@@ -31,7 +34,7 @@ default = ["registry", "io-uring"]
 registry = []
 io-uring = ["dep:io-uring"]
 libtpa = ["dep:libtpa-sys"]
-profiling = ["low-latency-utils/profiling"]
+profiling = ["dep:hdrhistogram", "dep:quanta"]
 dhat-heap = ["dep:dhat"]
 real-tx-example = [
     "dep:solana-sdk",

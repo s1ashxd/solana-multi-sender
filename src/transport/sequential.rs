@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use low_latency_utils::tsc::rdtsc;
-use low_latency_utils::{SpscConsumer, SpscProducer};
+use crate::rt::rdtsc;
+use crate::rt::spsc::{Consumer as SpscConsumer, Producer as SpscProducer};
 
 use crate::backend::raw_libc::RawLibc;
 use crate::backend::SeqBackend;
@@ -11,7 +11,7 @@ use crate::conn::reconnect::{ConnKind, ReconnectReq, ReconnectResp};
 use crate::conn::{http_conn_failed_io, ConnState, DualConn};
 use crate::error::TransportError;
 use crate::job::Job;
-use crate::result_lane::{RawResp, RESP_CAP, RESULT_RING};
+use crate::result_lane::{RawResp, RESP_CAP};
 use crate::sink::OutcomeKind;
 use crate::source::TxSource;
 use crate::transport::health::WorkerDiag;
@@ -23,9 +23,9 @@ pub const TRIGGER_RING: usize = 256;
 const PERIODIC_MASK: u32 = 0x3FF;
 
 pub struct SequentialWorker<B: SeqBackend> {
-    pub trigger: SpscConsumer<Job, TRIGGER_RING>,
+    pub trigger: SpscConsumer<Job>,
     pub conns: Vec<DualConn<ConnState<B>>>,
-    pub result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
+    pub result_tx: Vec<SpscProducer<RawResp>>,
     pub source: Arc<dyn TxSource>,
     pub inflight: Vec<Option<(Job, u64)>>,
     pub reconnect_req_tx: Sender<ReconnectReq>,
@@ -35,19 +35,19 @@ pub struct SequentialWorker<B: SeqBackend> {
     diag: Vec<DiagSlot>,
     jobs_sent: Vec<u64>,
     #[cfg(feature = "profiling")]
-    profiler: low_latency_utils::Profiler,
+    profiler: quanta::Clock,
     #[cfg(feature = "profiling")]
-    fill_stat: Vec<low_latency_utils::LatencyStat>,
+    fill_stat: Vec<hdrhistogram::Histogram<u64>>,
     #[cfg(feature = "profiling")]
-    submit_stat: Vec<low_latency_utils::LatencyStat>,
+    submit_stat: Vec<hdrhistogram::Histogram<u64>>,
 }
 
 impl<B: SeqBackend + 'static> SequentialWorker<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        trigger: SpscConsumer<Job, TRIGGER_RING>,
+        trigger: SpscConsumer<Job>,
         conns: Vec<DualConn<ConnState<B>>>,
-        result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
+        result_tx: Vec<SpscProducer<RawResp>>,
         source: Arc<dyn TxSource>,
         reconnect_req_tx: Sender<ReconnectReq>,
         reconnect_resp_rx: Vec<Receiver<ReconnectResp>>,
@@ -69,11 +69,15 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
             diag,
             jobs_sent: vec![0; n],
             #[cfg(feature = "profiling")]
-            profiler: low_latency_utils::Profiler::new(),
+            profiler: quanta::Clock::new(),
             #[cfg(feature = "profiling")]
-            fill_stat: (0..n).map(|_| low_latency_utils::LatencyStat::new()).collect(),
+            fill_stat: (0..n)
+                .map(|_| hdrhistogram::Histogram::<u64>::new(3).expect("hdrhistogram"))
+                .collect(),
             #[cfg(feature = "profiling")]
-            submit_stat: (0..n).map(|_| low_latency_utils::LatencyStat::new()).collect(),
+            submit_stat: (0..n)
+                .map(|_| hdrhistogram::Histogram::<u64>::new(3).expect("hdrhistogram"))
+                .collect(),
         }
     }
 
@@ -85,12 +89,12 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
                 for i in 0..self.conns.len() {
                     let pid = crate::job::ProviderId(i as u16);
                     #[cfg(feature = "profiling")]
-                    let t0 = self.profiler.mark();
+                    let t0 = self.profiler.raw();
                     let len = self.source.fill(pid, job, &mut scratch);
                     #[cfg(feature = "profiling")]
                     {
-                        let t1 = self.profiler.mark();
-                        self.fill_stat[i].record(self.profiler.elapsed(t0, t1));
+                        let t1 = self.profiler.raw();
+                        self.fill_stat[i].record(self.profiler.delta_as_nanos(t0, t1)).ok();
                     }
                     let end = usize::from(len);
                     self.send_to(i, job, sent, end, &scratch, pid);
@@ -110,7 +114,7 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
             }
             if self.trigger.is_empty() {
                 unsafe {
-                    low_latency_utils::wait::idle_wait(self.trigger.tail_ptr(), || {
+                    crate::rt::wait::idle_wait(self.trigger.monitor_addr(), || {
                         self.trigger.is_empty() && !stop.load(Ordering::Relaxed)
                     });
                 }
@@ -131,7 +135,7 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
     ) {
         let tx = &scratch[..end];
         #[cfg(feature = "profiling")]
-        let t0 = self.profiler.mark();
+        let t0 = self.profiler.raw();
         match &mut self.conns[i].active.conn {
             ConnState::Http(h) => match h.send_tx(tx) {
                 Ok(()) => {
@@ -156,8 +160,8 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
         }
         #[cfg(feature = "profiling")]
         {
-            let t1 = self.profiler.mark();
-            self.submit_stat[i].record(self.profiler.elapsed(t0, t1));
+            let t1 = self.profiler.raw();
+            self.submit_stat[i].record(self.profiler.delta_as_nanos(t0, t1)).ok();
         }
         let _ = pid;
     }
@@ -221,18 +225,21 @@ impl<B: SeqBackend + 'static> SequentialWorker<B> {
     fn publish_diag(&self) {
         for i in 0..self.diag.len() {
             #[cfg(feature = "profiling")]
-            let (fill_ns, submit_ns) = (self.fill_stat[i].snapshot(), self.submit_stat[i].snapshot());
+            let (fill_ns, submit_ns) = (
+                crate::transport::health::hist_snap(&self.fill_stat[i]),
+                crate::transport::health::hist_snap(&self.submit_stat[i]),
+            );
             #[cfg(not(feature = "profiling"))]
             let (fill_ns, submit_ns) = (
-                low_latency_utils::StatSnapshot::default(),
-                low_latency_utils::StatSnapshot::default(),
+                crate::transport::health::HistSnapshot::default(),
+                crate::transport::health::HistSnapshot::default(),
             );
-            self.diag[i].publish(WorkerDiag {
+            *self.diag[i].lock_write() = WorkerDiag {
                 alive: true,
                 jobs_sent: self.jobs_sent[i],
                 fill_ns,
                 submit_ns,
-            });
+            };
         }
     }
 }

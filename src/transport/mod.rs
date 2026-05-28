@@ -21,7 +21,7 @@ use crate::result_lane::{RawResp, ResultLane, RESULT_RING};
 use crate::sink::ResultSink;
 use crate::source::TxSource;
 use crate::transport::sequential::{SequentialWorker, TRIGGER_RING};
-use low_latency_utils::{SpscConsumer, SpscProducer};
+use crate::rt::spsc::{Consumer as SpscConsumer, Producer as SpscProducer};
 
 #[cfg(feature = "io-uring")]
 use crate::backend::io_uring::{IoUring, IoUringMode, IoUringTuning};
@@ -85,12 +85,12 @@ pub struct SenderBuilder {
 }
 
 enum Dispatch {
-    Single(SpscProducer<Job, TRIGGER_RING>),
-    Fanout(Vec<SpscProducer<Job, TRIGGER_RING>>),
+    Single(SpscProducer<Job>),
+    Fanout(Vec<SpscProducer<Job>>),
 }
 
 pub(crate) type DiagSlot =
-    std::sync::Arc<low_latency_utils::SharedDiagnostics<crate::transport::health::WorkerDiag>>;
+    std::sync::Arc<seqlock::SeqLock<crate::transport::health::WorkerDiag>>;
 
 pub struct Sender {
     dispatch: Dispatch,
@@ -117,7 +117,7 @@ impl Sender {
     pub fn trigger(&self, job: Job) -> Result<(), TriggerError> {
         match &self.dispatch {
             Dispatch::Single(tx) => {
-                if tx.try_push(job) {
+                if tx.try_push(job).is_ok() {
                     Ok(())
                 } else {
                     Err(TriggerError::Backpressure)
@@ -126,7 +126,7 @@ impl Sender {
             Dispatch::Fanout(txs) => {
                 let mut ok = true;
                 for tx in txs {
-                    if !tx.try_push(job) {
+                    if tx.try_push(job).is_err() {
                         ok = false;
                     }
                 }
@@ -153,7 +153,7 @@ impl Sender {
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                let w = d.read_latest().unwrap_or_default();
+                let w = d.read();
                 crate::transport::health::ProviderHealthEntry {
                     provider_idx: i,
                     alive: w.alive,
@@ -210,23 +210,23 @@ impl SenderBuilder {
         let stop = Arc::new(AtomicBool::new(false));
 
         let mut result_tx = Vec::new();
-        let mut result_rx: Vec<SpscConsumer<RawResp, RESULT_RING>> = Vec::new();
+        let mut result_rx: Vec<SpscConsumer<RawResp>> = Vec::new();
         let mut codecs: Vec<Arc<dyn ResponseCodec>> = Vec::new();
         for p in &self.providers {
-            let (tx, rx) = low_latency_utils::spsc::channel::<RawResp, RESULT_RING>();
+            let (tx, rx) = crate::rt::spsc::channel::<RawResp>(RESULT_RING);
             result_tx.push(tx);
             result_rx.push(rx);
             codecs.push(p.codec.clone());
         }
 
-        let lane = ResultLane::new(result_rx, codecs, sink);
+        let mut lane = ResultLane::new(result_rx, codecs, sink);
         let lane_stop = stop.clone();
         let lane_handle = std::thread::spawn(move || lane.run(&lane_stop));
 
         let n = self.providers.len();
         let diag: Vec<DiagSlot> = (0..n)
             .map(|_| {
-                std::sync::Arc::new(low_latency_utils::SharedDiagnostics::new(
+                std::sync::Arc::new(seqlock::SeqLock::new(
                     crate::transport::health::WorkerDiag::default(),
                 ))
             })
@@ -256,7 +256,7 @@ impl SenderBuilder {
                     let reconnect = ReconnectThread::spawn(builder, resp_txs, stop.clone());
                     let req_tx = reconnect.sender();
                     let (trig_tx, trig_rx) =
-                        low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+                        crate::rt::spsc::channel::<Job>(TRIGGER_RING);
                     let h = spawn_seq(
                         duals,
                         trig_rx,
@@ -289,7 +289,7 @@ impl SenderBuilder {
                     let reconnect = ReconnectThread::spawn(builder, resp_txs, stop.clone());
                     let req_tx = reconnect.sender();
                     let (trig_tx, trig_rx) =
-                        low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+                        crate::rt::spsc::channel::<Job>(TRIGGER_RING);
                     let h = spawn_seq(
                         duals,
                         trig_rx,
@@ -473,8 +473,8 @@ where
 #[allow(clippy::too_many_arguments)]
 fn spawn_seq<B>(
     duals: Vec<DualConn<ConnState<B>>>,
-    trigger: SpscConsumer<Job, TRIGGER_RING>,
-    result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
+    trigger: SpscConsumer<Job>,
+    result_tx: Vec<SpscProducer<RawResp>>,
     source: Arc<dyn TxSource>,
     reconnect_req_tx: crossbeam_channel::Sender<crate::conn::reconnect::ReconnectReq>,
     reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
@@ -502,7 +502,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn spawn_parallel<B>(
     duals: Vec<DualConn<ConnState<B>>>,
-    result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
+    result_tx: Vec<SpscProducer<RawResp>>,
     source: Arc<dyn TxSource>,
     cfg: crate::transport::parallel::ParallelConfig,
     reconnect_req_tx: crossbeam_channel::Sender<crate::conn::reconnect::ReconnectReq>,
@@ -533,7 +533,7 @@ where
         .zip(reconnect_resp_rx)
         .enumerate()
     {
-        let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+        let (trig_tx, trig_rx) = crate::rt::spsc::channel::<Job>(TRIGGER_RING);
         trigger_txs.push(trig_tx);
 
         let worker = ParWorker::new(
@@ -585,7 +585,7 @@ fn spawn_parallel_tpa(
     tls: Arc<ClientConfig>,
     source: Arc<dyn TxSource>,
     cfg: crate::transport::parallel::ParallelConfig,
-    result_tx: Vec<SpscProducer<RawResp, RESULT_RING>>,
+    result_tx: Vec<SpscProducer<RawResp>>,
     reconnect_req_tx: crossbeam_channel::Sender<crate::conn::reconnect::ReconnectReq>,
     reconnect_resp_rx: Vec<crossbeam_channel::Receiver<crate::conn::reconnect::ReconnectResp>>,
     stop: Arc<AtomicBool>,
@@ -605,7 +605,7 @@ fn spawn_parallel_tpa(
     let mut handles = Vec::with_capacity(providers.len());
 
     for ((i, res_tx), resp_rx) in result_tx.into_iter().enumerate().zip(reconnect_resp_rx) {
-        let (trig_tx, trig_rx) = low_latency_utils::spsc::channel::<Job, TRIGGER_RING>();
+        let (trig_tx, trig_rx) = crate::rt::spsc::channel::<Job>(TRIGGER_RING);
         trigger_txs.push(trig_tx);
 
         let providers_t = providers.clone();

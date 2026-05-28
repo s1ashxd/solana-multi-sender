@@ -1,8 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use low_latency_utils::spsc;
 use tx_sender::job::Job;
 use tx_sender::protocol::http::spec_builder::EnvelopeSpecBuilder;
+use tx_sender::rt::spsc;
 
 fn bench_trigger_submit(c: &mut Criterion) {
     let mut group = c.benchmark_group("trigger_submit");
@@ -20,7 +20,7 @@ fn bench_trigger_submit(c: &mut Criterion) {
         });
     });
 
-    let (prod, cons) = spsc::channel::<Job, 256>();
+    let (prod, mut cons) = spsc::channel::<Job>(256);
     group.bench_function("spsc_trigger_push", |b| {
         b.iter(|| {
             let _ = prod.try_push(black_box(Job { id: 1, ctx: 0 }));
