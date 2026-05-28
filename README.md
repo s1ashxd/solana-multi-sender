@@ -1,97 +1,136 @@
 # tx-sender
 
-A low-latency transaction sender library built around pluggable transport
-engines. Providers are configured over HTTP or QUIC, and transports range from
-the default raw `libc` socket backend to optional kernel-bypass paths.
+Low-latency tx sender for Solana SWQoS / RPC providers. Same `Sender` API over
+blocking `libc` sockets, `io_uring`, or DPDK (libtpa).
 
-## Example: send a real signed transaction (`examples/send_real_tx`)
+`Sender::builder()` wants four things:
 
-`examples/send_real_tx.rs` builds a real signed Solana transaction that carries a
-provider tip and submits it through the `Sequential::io_uring` HTTP path over
-TLS to a live SWQoS/RPC endpoint. The Solana dependencies it needs are isolated
-behind the opt-in `real-tx-example` feature, so the default build, tests, and
-clippy never compile them. The example itself is gated by `required-features`
-and is **not** part of CI: it needs a funded keypair, a real endpoint, and
-network access.
+- a `TransportSpec` (one of the modes below)
+- one or more `ProviderConfig` (HTTP or QUIC)
+- a `TxSource` that fills the wire payload for `(provider, job)`
+- a `ResultSink` that gets parsed outcomes
 
-Run it with:
+`sender.trigger(job)` is a non-blocking SPSC push; the network never touches
+the calling thread.
+
+## Modes
+
+### `Sequential::raw_libc()`
+
+One worker thread, blocking `libc::send` / `libc::recv`. Fans the job out to
+every provider in turn. Default and the most boring path.
+
+### `Sequential::io_uring(mode)` — feature `io-uring` (default on)
+
+Same single-worker fan-out, but the byte path runs through `io_uring`. TLS is
+still rustls.
+
+`IoUringMode`:
+
+- `BatchSyscall` — fill the SQ for every provider, then one `io_uring_enter`.
+- `SqeStream` — push one SQE at a time as each provider is filled.
+
+`IoUringTuning::sqpoll` turns on a kernel poll thread so `io_uring_enter`
+disappears from the hot path.
+
+### `Parallel::raw_libc()`
+
+One worker thread **per provider**, each with its own `DualConn` and trigger
+queue. `sender.trigger(job)` fans the push out across them.
+
+- `.affinity(CoreSet)` pins workers to cores.
+- `.rt_priority(prio)` sets `SCHED_FIFO`. Needs `CAP_SYS_NICE`.
+
+### `Parallel::libtpa()` — feature `libtpa` (default off)
+
+Same shape as `Parallel::raw_libc` but the backend is
+[libtpa](https://github.com/s1ashxd/libtpa), a DPDK userspace TCP/IP stack.
+TCP bypasses the kernel; QUIC still goes through the regular UDP socket.
+
+libtpa sockets are bound to the worker that opened them, so each worker
+attaches its own libtpa worker and connects from inside the thread. See
+[LibTpa backend](#libtpa-backend-feature-libtpa) for build/runtime setup.
+
+## Protocol
+
+Picked per provider, independent of the engine.
+
+- **HTTP/1.1 over TLS (rustls).** Envelope is built once and spliced in place
+  on every job — no allocs, no formatting on the hot path. Auth can be a
+  header, a URL query param, or a path token.
+- **QUIC** via `quinn-proto`. ed25519 and Falcon client certs for SWQoS auth.
+  Handshake at connect time, sends are fire-and-forget on a single stream.
+
+## Failover and reconnect
+
+Every provider holds a `DualConn` (active + standby). On a transport error
+the worker swaps to the standby and emits `TransportError::Failover` for the
+in-flight job. A shared background thread rebuilds the dead side over a
+one-shot crossbeam channel, without touching the worker.
+
+libtpa providers do not get rebuild: the socket has to be opened on its own
+worker thread. Failover still works, only reconnect-rebuild is skipped.
+
+## Provider registry — feature `registry` (default on)
+
+`crate::provider::registry` ships presets for 13 HTTP SWQoS endpoints and 3
+QUIC endpoints (Jito, Helius, NextBlock, Bloxroute, …). TLS roots come from
+`webpki-roots`, so a real sender needs only a keypair and an auth token.
+
+## Diagnostics
+
+- `sender.health()` → `ProviderHealthSnapshot` (`alive`, `jobs_sent`, and
+  with `profiling`: `fill_ns`, `submit_ns` percentiles measured via rdtsc).
+- `profiling` feature: TSC profiler + `LatencyStat` in both engines.
+- `dhat-heap` feature: gates the `dhat_zero_alloc` test that asserts the hot
+  path stays alloc-free after warmup.
+
+## Example
+
+`examples/send_real_tx.rs` signs a real Solana tx with a provider tip and
+sends it through `Sequential::io_uring` to a live endpoint. Gated behind
+`real-tx-example` so the default build doesn't pull Solana SDKs. Not in CI —
+needs a funded keypair, an endpoint, and network.
 
 ```bash
 cargo run --example send_real_tx --features real-tx-example
 ```
 
-Configuration is read from the environment.
-
-Required:
-
-- `TXSENDER_ENDPOINT` — `host[:port]/path` of the SWQoS/RPC endpoint, e.g.
-  `mainnet.block-engine.jito.wtf/api/v1/transactions`. The port defaults to 443
-  and `server_name` is taken from the host.
-- `TXSENDER_KEYPAIR` — path to a Solana `id.json` (64-byte JSON array) or, if it
-  is not a readable file, a base58-encoded 64-byte secret key.
-- `TXSENDER_TIP_ACCOUNT` — base58 pubkey of the provider's tip account. The
-  transaction includes a system transfer to this account; that tip is what pays
-  the SWQoS provider.
-- `TXSENDER_TIP_LAMPORTS` — tip amount in lamports.
-
-Optional:
-
-- `TXSENDER_AUTH` — HTTP auth header as `"Name: value"`.
-- `TXSENDER_CU_PRICE` — compute unit price in micro-lamports (default `100000`).
-- `TXSENDER_CU_LIMIT` — compute unit limit (default `100000`).
-- `TXSENDER_BLOCKHASH` — base58 recent blockhash to sign with.
-- `TXSENDER_BLOCKHASH_RPC` — RPC URL used to fetch a fresh blockhash when
-  `TXSENDER_BLOCKHASH` is unset.
-
-The example wires a single provider. `PreparedTxs` holds one prebuilt
-transaction per provider in `per_provider`. To fan out to multiple SWQoS
-providers, add a `.provider(...)` call per endpoint on the builder and build one
-transaction per provider in `PreparedTxs`, each with that provider's own tip
-account.
+Config is read from env: `TXSENDER_ENDPOINT`, `TXSENDER_KEYPAIR`,
+`TXSENDER_TIP_ACCOUNT`, `TXSENDER_TIP_LAMPORTS` (required) and
+`TXSENDER_AUTH`, `TXSENDER_CU_PRICE`, `TXSENDER_CU_LIMIT`,
+`TXSENDER_BLOCKHASH`, `TXSENDER_BLOCKHASH_RPC` (optional). See the file
+header for details.
 
 ## LibTpa backend (feature `libtpa`)
 
-The `libtpa` feature wires the [libtpa](https://github.com/Tencent/TCPDirect)
-DPDK-based userspace TCP/IP stack into the parallel engine as
-`Parallel::libtpa()` (`Engine::ParTpa`). It is **off by default** and is only
-intended for deployments with the required hardware and toolchain.
+### Build
 
-### Build requirements
+- `tpa.h` on the include path.
+- `libtpa.a` (or shared) reachable via `LIBTPA_PATH`. Defaults to
+  `/home/s1ash/libtpa`.
+- Link line: `tpa` + `numa dl pthread rt m`. Falls back to dynamic linking
+  if the static archive is missing.
 
-- `tpa.h` reachable for the FFI bindings.
-- A built `libtpa.a` (or shared `libtpa`). Point the build at it with the
-  `LIBTPA_PATH` environment variable; it defaults to `/home/s1ash/libtpa`.
-- The build script links `tpa` plus the system libraries `numa`, `dl`,
-  `pthread`, `rt`, and `m`. When `libtpa.a` is absent the build falls back to
-  dynamic linking.
+Compile-only (no link): `cargo build --lib --features libtpa`,
+`cargo clippy --features libtpa`.
 
-Compile-only checks (no link) are available via
-`cargo build --lib --features libtpa` and `cargo clippy --features libtpa`.
-
-### Runtime requirements
+### Runtime
 
 - DPDK v20.11.3.
-- Hugepages configured (for example via `nr_hugepages`).
-- A Mellanox NIC with flow bifurcation.
-- A `tpa.cfg` describing the NIC binding.
-- `CAP_SYS_NICE` and `CAP_IPC_LOCK` capabilities.
-- One process per NIC binding. This is enforced at runtime by an exclusive
-  `flock` on `/tmp/tx-sender-libtpa.lock`; a second process fails to start.
+- Hugepages (e.g. via `nr_hugepages`).
+- Mellanox NIC with flow bifurcation.
+- A `tpa.cfg` for the NIC binding.
+- `CAP_SYS_NICE` + `CAP_IPC_LOCK`.
+- One process per NIC binding. Enforced by an exclusive `flock` on
+  `/tmp/tx-sender-libtpa.lock`; a second process fails to start.
 
-### Known limitations
+### Caveats
 
-1. **Worker-bound sockets.** A libtpa socket may only be used on the worker
-   thread that initialized the worker. Connections are therefore established
-   inside each worker thread rather than ahead of time on the build thread.
-2. **Reconnect rebuild deferred.** Automatic reconnect-rebuild is not yet
-   supported for libtpa. Failover to the standby connection works, but the
-   reconnect thread skips `libtpa` providers because rebuilding a connection
-   requires the worker thread. In-worker reconnect is a follow-up.
-3. **QUIC is not kernel-bypassed.** QUIC providers used under
-   `Parallel::libtpa()` run on the standard socket-based QUIC engine with their
-   own UDP socket; they do not traverse the libtpa UDP path.
-4. **Not exercised in CI.** Both the link step and the runtime path require the
-   built library and the hardware above, so they are not covered by continuous
-   integration. The `libtpa_ffi` symbol/link test and the ignored
-   `libtpa_dpdk` integration scaffold only run where libtpa links and the
-   hardware is present.
+1. Worker-bound sockets. Connections are opened inside each worker thread,
+   not on the build thread.
+2. No reconnect-rebuild yet — only failover to standby works under libtpa.
+3. QUIC under `Parallel::libtpa()` still uses the kernel UDP socket.
+4. Not in CI: link and runtime both need the lib and the hardware. The
+   `libtpa_ffi` link test and the ignored `libtpa_dpdk` scaffold only run
+   where libtpa links and the NIC is present.
