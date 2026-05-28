@@ -4,6 +4,51 @@ A low-latency transaction sender library built around pluggable transport
 engines. Providers are configured over HTTP or QUIC, and transports range from
 the default raw `libc` socket backend to optional kernel-bypass paths.
 
+## Example: send a real signed transaction (`examples/send_real_tx`)
+
+`examples/send_real_tx.rs` builds a real signed Solana transaction that carries a
+provider tip and submits it through the `Sequential::io_uring` HTTP path over
+TLS to a live SWQoS/RPC endpoint. The Solana dependencies it needs are isolated
+behind the opt-in `real-tx-example` feature, so the default build, tests, and
+clippy never compile them. The example itself is gated by `required-features`
+and is **not** part of CI: it needs a funded keypair, a real endpoint, and
+network access.
+
+Run it with:
+
+```bash
+cargo run --example send_real_tx --features real-tx-example
+```
+
+Configuration is read from the environment.
+
+Required:
+
+- `TXSENDER_ENDPOINT` — `host[:port]/path` of the SWQoS/RPC endpoint, e.g.
+  `mainnet.block-engine.jito.wtf/api/v1/transactions`. The port defaults to 443
+  and `server_name` is taken from the host.
+- `TXSENDER_KEYPAIR` — path to a Solana `id.json` (64-byte JSON array) or, if it
+  is not a readable file, a base58-encoded 64-byte secret key.
+- `TXSENDER_TIP_ACCOUNT` — base58 pubkey of the provider's tip account. The
+  transaction includes a system transfer to this account; that tip is what pays
+  the SWQoS provider.
+- `TXSENDER_TIP_LAMPORTS` — tip amount in lamports.
+
+Optional:
+
+- `TXSENDER_AUTH` — HTTP auth header as `"Name: value"`.
+- `TXSENDER_CU_PRICE` — compute unit price in micro-lamports (default `100000`).
+- `TXSENDER_CU_LIMIT` — compute unit limit (default `100000`).
+- `TXSENDER_BLOCKHASH` — base58 recent blockhash to sign with.
+- `TXSENDER_BLOCKHASH_RPC` — RPC URL used to fetch a fresh blockhash when
+  `TXSENDER_BLOCKHASH` is unset.
+
+The example wires a single provider. `PreparedTxs` holds one prebuilt
+transaction per provider in `per_provider`. To fan out to multiple SWQoS
+providers, add a `.provider(...)` call per endpoint on the builder and build one
+transaction per provider in `PreparedTxs`, each with that provider's own tip
+account.
+
 ## LibTpa backend (feature `libtpa`)
 
 The `libtpa` feature wires the [libtpa](https://github.com/Tencent/TCPDirect)
