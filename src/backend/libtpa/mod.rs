@@ -1,4 +1,4 @@
-pub mod ffi;
+pub use libtpa_sys as ffi;
 
 use std::ffi::CString;
 use std::io;
@@ -58,7 +58,7 @@ pub struct TpaConn {
 }
 
 pub struct LibTpa {
-    worker: *mut ffi::tpa_worker,
+    worker: *mut ffi::TpaWorker,
 }
 
 impl LibTpa {
@@ -70,7 +70,7 @@ impl LibTpa {
     }
 
     #[must_use]
-    pub fn with_worker(worker: *mut ffi::tpa_worker) -> Self {
+    pub fn with_worker(worker: *mut ffi::TpaWorker) -> Self {
         Self { worker }
     }
 
@@ -84,7 +84,7 @@ impl LibTpa {
     }
 
     #[must_use]
-    pub fn worker(&self) -> *mut ffi::tpa_worker {
+    pub fn worker(&self) -> *mut ffi::TpaWorker {
         self.worker
     }
 
@@ -132,10 +132,10 @@ impl LibTpa {
     }
 
     fn recv_udp(&mut self, _conn: &TpaConn, buf: &mut [u8]) -> io::Result<usize> {
-        let mut pkt = ffi::tpa_udp_pkt {
+        let mut pkt = ffi::TpaUdpPkt {
             buf: buf.as_mut_ptr().cast(),
             len: buf.len() as u16,
-            remote_ip: ffi::tpa_ip { u64_: [0, 0] },
+            remote_ip: ffi::TpaIp::zeroed(),
             remote_port: 0,
             local_port: 0,
         };
@@ -147,7 +147,7 @@ impl LibTpa {
     }
 
     fn recv_tcp(&mut self, conn: &TpaConn, buf: &mut [u8]) -> io::Result<usize> {
-        let mut ev = ffi::tpa_event {
+        let mut ev = ffi::TpaEvent {
             events: 0,
             data: std::ptr::null_mut(),
         };
@@ -155,7 +155,7 @@ impl LibTpa {
         if n <= 0 || ev.events & ffi::TPA_EVENT_IN == 0 {
             return Ok(0);
         }
-        let mut iov = ffi::tpa_iovec {
+        let mut iov = ffi::TpaIovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_phys: 0,
             iov_len: buf.len() as u32,
@@ -238,11 +238,11 @@ fn split_host_port(endpoint: &str) -> Option<(&str, u16)> {
     Some((host, port))
 }
 
-fn tpa_ip_from_v4(addr: Ipv4Addr) -> ffi::tpa_ip {
-    let mut ip = ffi::tpa_ip { u64_: [0, 0] };
+fn tpa_ip_from_v4(addr: Ipv4Addr) -> ffi::TpaIp {
+    let mut ip = ffi::TpaIp::zeroed();
     unsafe {
-        ip.u32_[2] = 0xffff0000u32;
-        ip.u32_[3] = u32::from(addr).to_be();
+        ip.u32[2] = 0xffff0000u32;
+        ip.u32[3] = u32::from(addr).to_be();
     }
     ip
 }
@@ -253,8 +253,8 @@ fn build_udp_pkt(
     remote: Ipv4Addr,
     remote_port: u16,
     local_port: u16,
-) -> ffi::tpa_udp_pkt {
-    ffi::tpa_udp_pkt {
+) -> ffi::TpaUdpPkt {
+    ffi::TpaUdpPkt {
         buf,
         len,
         remote_ip: tpa_ip_from_v4(remote),
@@ -290,8 +290,8 @@ mod tests {
     fn ipv4_maps_into_tpa_ip() {
         let ip = tpa_ip_from_v4(Ipv4Addr::new(1, 2, 3, 4));
         unsafe {
-            assert_eq!(ip.u32_[3], u32::from(Ipv4Addr::new(1, 2, 3, 4)).to_be());
-            assert_eq!(ip.u32_[2], 0xffff0000u32);
+            assert_eq!(ip.u32[3], u32::from(Ipv4Addr::new(1, 2, 3, 4)).to_be());
+            assert_eq!(ip.u32[2], 0xffff0000u32);
         }
     }
 

@@ -15,6 +15,7 @@ quinn-proto = { version = "0.11", default-features = false, features = ["rustls-
 bytes = "1"
 rcgen = "0.13"
 io-uring = { version = "0.7", optional = true }
+libtpa-sys = { path = "../libtpa-sys", optional = true }
 crossbeam-channel = "0.5"
 webpki-roots = "0.26"
 dhat = { version = "0.3", optional = true }
@@ -29,7 +30,7 @@ bs58 = { version = "0.5", optional = true }
 default = ["registry", "io-uring"]
 registry = []
 io-uring = ["dep:io-uring"]
-libtpa = []
+libtpa = ["dep:libtpa-sys"]
 profiling = ["low-latency-utils/profiling"]
 dhat-heap = ["dep:dhat"]
 real-tx-example = [

@@ -106,14 +106,17 @@ header for details.
 
 ### Build
 
-- `tpa.h` on the include path.
-- `libtpa.a` (or shared) reachable via `LIBTPA_PATH`. Defaults to
-  `/home/s1ash/libtpa`.
-- Link line: `tpa` + `numa dl pthread rt m`. Falls back to dynamic linking
-  if the static archive is missing.
+FFI bindings live in the sibling [`libtpa-sys`](../libtpa-sys) crate and are
+pulled in by the `libtpa` feature. Linking is driven by `pkg-config`:
 
-Compile-only (no link): `cargo build --lib --features libtpa`,
-`cargo clippy --features libtpa`.
+- `libtpa.pc` reachable through `PKG_CONFIG_PATH` (defaults to
+  `/usr/share/tpa` in the libtpa-sys build script).
+- The .pc file is expected to advertise `tpa` along with the usual DPDK
+  system libs (`numa dl pthread rt m`). Static `-l:libtpa.a` is honored.
+
+Compile-only checks still need a resolvable libtpa.pc — running
+`cargo build --lib --features libtpa` or `cargo clippy --features libtpa`
+will invoke pkg-config.
 
 ### Runtime
 

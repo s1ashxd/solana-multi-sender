@@ -21,6 +21,6 @@ fn ffi_symbols_link() {
 
 #[test]
 fn struct_sizes_sane() {
-    assert_eq!(core::mem::size_of::<ffi::tpa_sock_opts>(), 128);
-    assert!(core::mem::size_of::<ffi::tpa_udp_pkt>() >= 24);
+    assert_eq!(core::mem::size_of::<ffi::TpaSockOpts>(), 128);
+    assert!(core::mem::size_of::<ffi::TpaUdpPkt>() >= 24);
 }
